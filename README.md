@@ -44,7 +44,6 @@ Add this to your `settings.json` (paths are examples):
     "thePrometheus Codex": {
       "type": "custom",
       "command": "/absolute/path/to/theprometheus-codex-acp",
-      "args": ["--acp"],
       "env": {}
     }
   }
