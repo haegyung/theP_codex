@@ -1,0 +1,15 @@
+id = "theprometheus-codex-acp"
+name = "thePrometheus Codex ACP"
+version = "0.9.1"
+schema_version = 1
+authors = ["haegyung"]
+description = "Codex CLI parity ACP adapter with shared CODEX_HOME."
+repository = "https://github.com/haegyung/theP_codex"
+
+[agent_servers.theprometheus]
+name = "thePrometheus Codex"
+icon = "icons/theprometheus.svg"
+
+[agent_servers.theprometheus.targets.darwin-aarch64]
+archive = "https://github.com/haegyung/theP_codex/releases/download/v0.9.1/theprometheus-codex-acp-darwin-arm64.tar.gz"
+cmd = "./codex-acp"
