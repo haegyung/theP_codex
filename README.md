@@ -41,7 +41,7 @@ Add this to your `settings.json` (paths are examples; Zed may not expand `$HOME`
 ```
 {
   "agent_servers": {
-    "thePrometheus Codex": {
+    "thePrometheus Codex ACP": {
       "type": "custom",
       "command": "/absolute/path/to/theprometheus-codex-acp",
       "env": {
@@ -52,7 +52,7 @@ Add this to your `settings.json` (paths are examples; Zed may not expand `$HOME`
 }
 ```
 
-Then open the Agent Panel and start a new thread for "thePrometheus Codex".
+Then open the Agent Panel and start a new thread for "thePrometheus Codex ACP".
 
 ## Automation
 
@@ -83,7 +83,7 @@ scripts/zed_settings_restore.sh /path/to/settings.json.bak-YYYYmmddTHHMMSSZ
 scripts/tag_release.sh
 ```
 
-Pushing a tag (e.g. `v0.9.1`) triggers the GitHub Actions release workflow.
+Pushing a tag (e.g. `v0.9.2`) triggers the GitHub Actions release workflow.
 
 ### Other clients
 
@@ -100,22 +100,22 @@ cargo build --release
 The resulting binary is at:
 
 ```
-target/release/codex-acp
+target/release/theprometheus-codex-acp
 ```
 
 Install the upstream adapter from the latest release if you need a prebuilt binary:
-https://github.com/zed-industries/codex-acp/releases
+https://github.com/haegyung/theP_codex/releases
 
-You can then use `codex-acp` as a regular ACP agent:
+You can then use `theprometheus-codex-acp` as a regular ACP agent:
 
 ```
-OPENAI_API_KEY=sk-... codex-acp
+OPENAI_API_KEY=sk-... theprometheus-codex-acp
 ```
 
 Or via npm:
 
 ```
-npx @zed-industries/codex-acp
+npx @haegyung/theprometheus-codex-acp
 ```
 
 ## License

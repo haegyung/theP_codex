@@ -28,8 +28,8 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     error::CodexErr,
     models_manager::manager::{ModelsManager, RefreshStrategy},
-    parse_turn_item,
     parse_command::parse_command,
+    parse_turn_item,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
@@ -41,9 +41,8 @@ use codex_core::{
         PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, SandboxPolicy, SessionSource, StreamErrorEvent, TerminalInteractionEvent,
-        TurnAbortedEvent,
-        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
-        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -1764,14 +1763,12 @@ impl<A: Auth> ThreadActor<A> {
                 "summarize conversation to prevent hitting the context limit",
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
-            AvailableCommand::new(
-                "sessions",
-                "list recent sessions for the current workspace",
-            ),
-            AvailableCommand::new("load", "show instructions to open a previous session")
-                .input(AvailableCommandInput::Unstructured(
-                    UnstructuredCommandInput::new("session id or list number"),
+            AvailableCommand::new("sessions", "list recent sessions for the current workspace"),
+            AvailableCommand::new("load", "show instructions to open a previous session").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "session id or list number",
                 )),
+            ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -1961,10 +1958,9 @@ impl<A: Auth> ThreadActor<A> {
             .items
             .into_iter()
             .filter_map(|item| {
-                let session_meta_line = item
-                    .head
-                    .first()
-                    .and_then(|first| serde_json::from_value::<SessionMetaLine>(first.clone()).ok())?;
+                let session_meta_line = item.head.first().and_then(|first| {
+                    serde_json::from_value::<SessionMetaLine>(first.clone()).ok()
+                })?;
 
                 if session_meta_line.meta.cwd != self.config.cwd {
                     return None;
@@ -2192,7 +2188,9 @@ impl<A: Auth> ThreadActor<A> {
 
         let Some(session_id) = target_id else {
             self.client
-                .send_agent_text("Unknown session selection. Run /sessions and pick a valid number.")
+                .send_agent_text(
+                    "Unknown session selection. Run /sessions and pick a valid number.",
+                )
                 .await;
             return Ok(());
         };

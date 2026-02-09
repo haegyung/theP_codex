@@ -1,17 +1,17 @@
 {
-	"name": "@zed-industries/codex-acp",
-	"version": "0.9.1",
+	"name": "@haegyung/theprometheus-codex-acp",
+	"version": "0.9.2",
 	"type": "module",
 	"description": "An ACP-compatible coding agent powered by Codex",
 	"license": "Apache-2.0",
-	"author": "Zed <hi@zed.dev>",
-	"homepage": "https://github.com/zed-industries/codex-acp",
+	"author": "haegyung",
+	"homepage": "https://github.com/haegyung/theP_codex",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/zed-industries/codex-acp.git"
+		"url": "git+https://github.com/haegyung/theP_codex.git"
 	},
 	"bugs": {
-		"url": "https://github.com/zed-industries/codex-acp/issues"
+		"url": "https://github.com/haegyung/theP_codex/issues"
 	},
 	"keywords": [
 		"codex",
@@ -22,17 +22,17 @@
 		"assistant"
 	],
 	"bin": {
-		"codex-acp": "bin/codex-acp.js"
+		"theprometheus-codex-acp": "bin/theprometheus-codex-acp.js"
 	},
 	"files": [
 		"bin"
 	],
 	"optionalDependencies": {
-		"@zed-industries/codex-acp-darwin-arm64": "0.9.1",
-		"@zed-industries/codex-acp-darwin-x64": "0.9.1",
-		"@zed-industries/codex-acp-linux-arm64": "0.9.1",
-		"@zed-industries/codex-acp-linux-x64": "0.9.1",
-		"@zed-industries/codex-acp-win32-arm64": "0.9.1",
-		"@zed-industries/codex-acp-win32-x64": "0.9.1"
+		"@haegyung/theprometheus-codex-acp-darwin-arm64": "0.9.2",
+		"@haegyung/theprometheus-codex-acp-darwin-x64": "0.9.2",
+		"@haegyung/theprometheus-codex-acp-linux-arm64": "0.9.2",
+		"@haegyung/theprometheus-codex-acp-linux-x64": "0.9.2",
+		"@haegyung/theprometheus-codex-acp-win32-arm64": "0.9.2",
+		"@haegyung/theprometheus-codex-acp-win32-x64": "0.9.2"
 	}
 }

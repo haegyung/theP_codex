@@ -1,13 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` holds the Rust crate (`codex-acp`), with `src/main.rs` as the binary entry and `src/lib.rs` exposing shared pieces.
+- `src/` holds the Rust crate (`theprometheus-codex-acp`), with `src/main.rs` as the primary binary entry and `src/lib.rs` exposing shared pieces.
 - `scripts/` hosts operational shell scripts (build/install, tagging, Zed settings backup/restore).
 - `npm/` keeps the npm wrapper, platform metadata, and JS testing helpers.
 - `logs/` and `target/` are runtime and build artifacts; keep `logs/` clean and never commit `target/`.
 
 ## Build, Test, and Development Commands
-- `cargo build --release`: compiles the optimized binary at `target/release/codex-acp`.
+- `cargo build --release`: compiles the optimized binary at `target/release/theprometheus-codex-acp`.
 - `cargo test`: runs Rust unit tests, currently centered in `src/prompt_args.rs`.
 - `scripts/build_and_install.sh`: builds the binary and installs it; respects `INSTALL_PATH` and `CARGO_TARGET_DIR`.
 - `scripts/tag_release.sh vX.Y.Z`: tags a release (e.g., `v0.9.1`) to trigger CI workflows.
@@ -31,4 +31,3 @@
 ## Security & Configuration Tips
 - Never commit API keys or other secrets; rely on environment variables such as `OPENAI_API_KEY` or `CODEX_API_KEY`.
 - Keep Zed settings synchronized via `scripts/zed_settings_backup.sh`/`restore` when adjusting local config (if used).
-

@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout codex-acp
+      - name: Checkout theprometheus-codex-acp
         uses: actions/checkout@v4
 
       - name: Install Rust

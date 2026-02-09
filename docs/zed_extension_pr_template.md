@@ -7,12 +7,12 @@ Use this template when submitting the extension update to `zed-industries/extens
 
 ### Summary
 - registers thePrometheus Codex ACP as a Zed extension
-- reuses `codex-acp` binary (v0.9.1) and shares CODEX_HOME with CLI
+- uses `theprometheus-codex-acp` binary (v0.9.2) and shares CODEX_HOME with CLI
 - adds documentation links for installation, verification, and CODEX_HOME sharing
 
 ### Testing
 - `cargo test`
-- `codex-acp` run with `/review`, `/compact`, `/undo` (manual)
+- `theprometheus-codex-acp` run with `/review`, `/compact`, `/undo` (manual)
 - Verified Plan/ToolCall/RequestPermission logging via `docs/event_handling.md`
 
 ### Files added/updated

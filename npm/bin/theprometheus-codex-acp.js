@@ -11,16 +11,16 @@ function getPlatformPackage() {
 
   const platformMap = {
     darwin: {
-      arm64: "codex-acp-darwin-arm64",
-      x64: "codex-acp-darwin-x64",
+      arm64: "theprometheus-codex-acp-darwin-arm64",
+      x64: "theprometheus-codex-acp-darwin-x64",
     },
     linux: {
-      arm64: "codex-acp-linux-arm64",
-      x64: "codex-acp-linux-x64",
+      arm64: "theprometheus-codex-acp-linux-arm64",
+      x64: "theprometheus-codex-acp-linux-x64",
     },
     win32: {
-      arm64: "codex-acp-win32-arm64",
-      x64: "codex-acp-win32-x64",
+      arm64: "theprometheus-codex-acp-win32-arm64",
+      x64: "theprometheus-codex-acp-win32-x64",
     },
   };
 
@@ -36,14 +36,16 @@ function getPlatformPackage() {
     process.exit(1);
   }
 
-  return `@zed-industries/${packageName}`;
+  return `@haegyung/${packageName}`;
 }
 
 // Locate the binary
 function getBinaryPath() {
   const packageName = getPlatformPackage();
   const binaryName =
-    process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
+    process.platform === "win32"
+      ? "theprometheus-codex-acp.exe"
+      : "theprometheus-codex-acp";
 
   try {
     // Try to resolve the platform-specific package

@@ -6,7 +6,7 @@ param (
 
 $ErrorActionPreference = 'Stop'
 
-Write-Host "Windows code signing script for codex-acp"
+Write-Host "Windows code signing script for theprometheus-codex-acp"
 Write-Host "Binary path: $BinaryPath"
 
 if (-not (Test-Path $BinaryPath)) {

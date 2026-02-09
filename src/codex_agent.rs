@@ -235,7 +235,10 @@ impl Agent for CodexAgent {
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
-            .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
+            .agent_info(
+                Implementation::new("theprometheus-codex-acp", env!("CARGO_PKG_VERSION"))
+                    .title("thePrometheus Codex ACP"),
+            )
             .auth_methods(auth_methods))
     }
 

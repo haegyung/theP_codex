@@ -26,9 +26,9 @@ fi
   fi
 )
 
-BIN_PATH="$ROOT_DIR/target/release/codex-acp"
+BIN_PATH="$ROOT_DIR/target/release/theprometheus-codex-acp"
 if [[ -n "$CARGO_TARGET_DIR_VALUE" ]]; then
-  BIN_PATH="$CARGO_TARGET_DIR_VALUE/release/codex-acp"
+  BIN_PATH="$CARGO_TARGET_DIR_VALUE/release/theprometheus-codex-acp"
 fi
 
 if [[ ! -f "$BIN_PATH" ]]; then
@@ -36,7 +36,12 @@ if [[ ! -f "$BIN_PATH" ]]; then
   exit 1
 fi
 
-cp -f "$BIN_PATH" "$INSTALL_PATH"
-chmod +x "$INSTALL_PATH"
+INSTALL_DIR="$(dirname "$INSTALL_PATH")"
+TMP_PATH="$INSTALL_DIR/.theprometheus-codex-acp.tmp.$$"
+
+# Install via atomic rename so we don't follow an existing symlink target.
+cp -f "$BIN_PATH" "$TMP_PATH"
+chmod +x "$TMP_PATH"
+mv -f "$TMP_PATH" "$INSTALL_PATH"
 
 echo "Installed: $INSTALL_PATH"
