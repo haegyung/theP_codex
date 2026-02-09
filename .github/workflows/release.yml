@@ -237,13 +237,21 @@ jobs:
 
       - name: Publish platform packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # If NPM_TOKEN is not set, we fall back to npm "trusted publishing" (OIDC) via --provenance.
+          # If neither is configured, npm will fail with ENEEDAUTH.
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "${NPM_CONFIG_USERCONFIG}"
+          else
+            echo "registry=https://registry.npmjs.org/" > "${NPM_CONFIG_USERCONFIG}"
+          fi
+
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish --access public
+              npm publish --access public --provenance
               cd ../..
             fi
           done
@@ -280,10 +288,16 @@ jobs:
 
       - name: Publish base package
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "${NPM_CONFIG_USERCONFIG}"
+          else
+            echo "registry=https://registry.npmjs.org/" > "${NPM_CONFIG_USERCONFIG}"
+          fi
+
           cd npm
-          npm publish --access public
+          npm publish --access public --provenance
 
   create-release:
     name: Create Release
