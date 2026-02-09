@@ -83,7 +83,21 @@ scripts/zed_settings_restore.sh /path/to/settings.json.bak-YYYYmmddTHHMMSSZ
 scripts/tag_release.sh
 ```
 
-Pushing a tag (e.g. `v0.9.3`) triggers the GitHub Actions release workflow.
+Pushing a tag (e.g. `v0.9.4`) triggers the GitHub Actions release workflow.
+
+## Verification (local)
+
+Run Rust unit tests (includes a chained slash-command smoke flow test):
+
+```
+cargo test
+```
+
+Validate npm platform detection logic:
+
+```
+node npm/testing/test-platform-detection.js
+```
 
 ### Other clients
 

@@ -5185,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "theprometheus-codex-acp"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
