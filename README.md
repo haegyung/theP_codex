@@ -83,7 +83,7 @@ scripts/zed_settings_restore.sh /path/to/settings.json.bak-YYYYmmddTHHMMSSZ
 scripts/tag_release.sh
 ```
 
-Pushing a tag (e.g. `v0.9.2`) triggers the GitHub Actions release workflow.
+Pushing a tag (e.g. `v0.9.3`) triggers the GitHub Actions release workflow.
 
 ### Other clients
 

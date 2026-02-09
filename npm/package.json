@@ -1,6 +1,6 @@
 {
 	"name": "@haegyung/theprometheus-codex-acp",
-	"version": "0.9.2",
+	"version": "0.9.3",
 	"type": "module",
 	"description": "An ACP-compatible coding agent powered by Codex",
 	"license": "Apache-2.0",
@@ -28,11 +28,11 @@
 		"bin"
 	],
 	"optionalDependencies": {
-		"@haegyung/theprometheus-codex-acp-darwin-arm64": "0.9.2",
-		"@haegyung/theprometheus-codex-acp-darwin-x64": "0.9.2",
-		"@haegyung/theprometheus-codex-acp-linux-arm64": "0.9.2",
-		"@haegyung/theprometheus-codex-acp-linux-x64": "0.9.2",
-		"@haegyung/theprometheus-codex-acp-win32-arm64": "0.9.2",
-		"@haegyung/theprometheus-codex-acp-win32-x64": "0.9.2"
+		"@haegyung/theprometheus-codex-acp-darwin-arm64": "0.9.3",
+		"@haegyung/theprometheus-codex-acp-darwin-x64": "0.9.3",
+		"@haegyung/theprometheus-codex-acp-linux-arm64": "0.9.3",
+		"@haegyung/theprometheus-codex-acp-linux-x64": "0.9.3",
+		"@haegyung/theprometheus-codex-acp-win32-arm64": "0.9.3",
+		"@haegyung/theprometheus-codex-acp-win32-x64": "0.9.3"
 	}
 }
