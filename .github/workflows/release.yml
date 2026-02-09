@@ -211,7 +211,7 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && !github.event.repository.fork }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -233,12 +233,14 @@ jobs:
           path: npm-packages
 
       - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish
+              npm publish --access public
               cd ../..
             fi
           done
@@ -247,7 +249,7 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && !github.event.repository.fork }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -274,9 +276,11 @@ jobs:
           sleep 30
 
       - name: Publish base package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          npm publish
+          npm publish --access public
 
   create-release:
     name: Create Release
