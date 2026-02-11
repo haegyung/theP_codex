@@ -25,7 +25,7 @@ jobs:
       version: ${{ steps.get_version.outputs.version }}
       tag_name: ${{ steps.get_version.outputs.tag_name }}
     steps:
-      - name: Checkout theprometheus-codex-acp
+      - name: Checkout xsfire-camp
         uses: actions/checkout@v4
 
       - name: Get version from Cargo.toml
@@ -136,7 +136,7 @@ jobs:
       - name: Code sign macOS binary
         if: startsWith(matrix.os, 'macos') && env.MACOS_CERTIFICATE != ''
         run: |
-          ./script/sign-mac target/${{ matrix.target }}/release/theprometheus-codex-acp
+          ./script/sign-mac target/${{ matrix.target }}/release/xsfire-camp
 
       - name: Code sign Windows binary
         if: startsWith(matrix.os, 'windows') && env.AZURE_TENANT_ID != ''
@@ -145,14 +145,14 @@ jobs:
           TIMESTAMP_DIGEST: SHA256
           TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
         run: |
-          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\theprometheus-codex-acp.exe
+          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\xsfire-camp.exe
 
       - name: Create archive
         id: create_archive
         shell: bash
         run: |
-          BINARY_NAME="theprometheus-codex-acp${{ matrix.binary_extension }}"
-          ARCHIVE_NAME="theprometheus-codex-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
+          BINARY_NAME="xsfire-camp${{ matrix.binary_extension }}"
+          ARCHIVE_NAME="xsfire-camp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
 
           cd target/${{ matrix.target }}/release
 
