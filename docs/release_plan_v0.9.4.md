@@ -1,6 +1,16 @@
-# v0.9.4 Release Plan (Draft)
+# v0.9.4 Release Plan
 
 Scope: reinforce ACP slash command parity and make local repo artifacts less noisy, without changing external behavior.
+
+## Status (2026-02-11)
+- Completed.
+- Verification run:
+  - `cargo test` -> `20 passed; 0 failed` (includes `thread::tests::test_slash_command_smoke_flow`)
+  - `node npm/testing/test-platform-detection.js` -> all platform detection tests passed
+- Repo hygiene check:
+  - `.gitignore` includes `logs` and `.DS_Store`
+  - no tracked files under `logs/`
+  - no tracked `.DS_Store` files
 
 ## Goals
 - Add a scenario-based smoke test that chains common slash commands in one session.
@@ -16,4 +26,3 @@ Scope: reinforce ACP slash command parity and make local repo artifacts less noi
 ## Non-Goals
 - No public API changes.
 - No behavior changes to command semantics; only coverage and hygiene.
-
