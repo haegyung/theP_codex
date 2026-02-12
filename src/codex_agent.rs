@@ -244,8 +244,7 @@ impl Agent for CodexAgent {
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(
-                Implementation::new("xsfire-camp", env!("CARGO_PKG_VERSION"))
-                    .title("xsfire-camp"),
+                Implementation::new("xsfire-camp", env!("CARGO_PKG_VERSION")).title("xsfire-camp"),
             )
             .auth_methods(auth_methods))
     }
@@ -620,18 +619,22 @@ impl From<CodexAuthMethod> for AuthMethodId {
 impl From<CodexAuthMethod> for AuthMethod {
     fn from(method: CodexAuthMethod) -> Self {
         match method {
-            CodexAuthMethod::ChatGpt => Self::new(method, "Login with ChatGPT").description(
-                "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
+            CodexAuthMethod::ChatGpt => Self::new(method, "ChatGPT (Browser login)").description(
+                "Opens a local login server and launches your browser.\nComplete login, then return to the IDE.\nTip: set NO_BROWSER=1 for headless/SSH workflows and use an API key method.",
             ),
             CodexAuthMethod::CodexApiKey => {
-                Self::new(method, format!("Use {CODEX_API_KEY_ENV_VAR}")).description(format!(
-                    "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
-                ))
+                Self::new(method, format!("API key ({CODEX_API_KEY_ENV_VAR})")).description(
+                    format!(
+                        "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable.\nIn Zed, set this in your agent server `env` configuration."
+                    ),
+                )
             }
             CodexAuthMethod::OpenAiApiKey => {
-                Self::new(method, format!("Use {OPENAI_API_KEY_ENV_VAR}")).description(format!(
-                    "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
-                ))
+                Self::new(method, format!("API key ({OPENAI_API_KEY_ENV_VAR})")).description(
+                    format!(
+                        "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable.\nIn Zed, set this in your agent server `env` configuration."
+                    ),
+                )
             }
         }
     }

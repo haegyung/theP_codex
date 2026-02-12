@@ -8,13 +8,13 @@
 cargo test
 ```
 
-현재 `thread.rs`/`prompt_args.rs`에 있는 단위 테스트(16개)가 실행되며, Task/Prompt 흐름을 포함합니다. 성공 메시지가 나오면 기본 Promise loop가 깨지지 않고 `PromptState`가 정상 작동함을 의미합니다.
+현재 `thread.rs`/`prompt_args.rs`에 있는 단위 테스트가 실행되며, Task/Prompt 흐름을 포함합니다. 성공 메시지가 나오면 기본 Promise loop가 깨지지 않고 `PromptState`가 정상 작동함을 의미합니다.
 
 ## 2. 수동 검증 시나리오
 
 CIDR–like manual verification steps:
 1. `CODEX_HOME`이 CLI와 동일한지 확인하고, 같은 `threads/`/`rollouts/`/`credentials/` 디렉토리 경로를 사용하세요.
-2. ACP(예: `xsfire-camp`)를 실행하고 `/compact`, `/review`, `/undo`, `/init` 등 beta slash 명령을 순차적으로 실행합니다.
+2. ACP(예: `xsfire-camp`)를 실행하고 `/setup`, `/status`, `/monitor`, `/vector`, `/compact`, `/review`, `/undo`, `/init` 등 slash 명령을 순차적으로 실행합니다.
 3. `logs/codex_chats/<agent>/<timestamp>.md`에 새 turn이 기록되는지 확인하며, 각 turn에서 `Plan`/`ToolCall`/`RequestPermission`이 나오는지 검토합니다.
 4. `docs/event_handling.md`에 정리한 매핑에 따라 각 `EventMsg`(PlanUpdate, ExecCommand*, McpToolCall*, RequestUserInput 등)가 ACP notification으로 나오는지 확인하고, KVS 로그(예: `tracing` 출력)를 참고하세요.
 5. 웹 인터페이스(Zed)를 사용하는 경우, 해당 slash 명령을 실행하면서 Agent Panel에 `Plan`, `Tool Calls`, `Terminal` 탭이 정상적으로 업데이트되는지 보세요.

@@ -25,7 +25,8 @@ Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 - Tool calls(쉘 실행, apply_patch, 웹 검색, MCP tool call 등) 스트리밍 및 결과 업데이트
 - 승인(Approvals) 플로우: 실행/패치 등 위험 동작을 `RequestPermission`으로 노출하고 사용자 선택을 반영
 - Plan/TODO/Terminal 등 “작업 진행” 신호를 ACP `SessionUpdate`로 전달
-- Codex CLI parity 중심의 slash commands 지원: `/review`, `/compact`, `/undo`, `/init`, `/sessions`, `/load`, `/mcp`, `/skills` 등
+- Codex CLI parity 중심의 slash commands 지원: `/setup`, `/review`, `/compact`, `/undo`, `/init`, `/sessions`, `/load`, `/mcp`, `/skills` 등
+- 모니터링/UX 보조: `/monitor`(플랜/컨텍스트 사용량/트레이스), `/vector`(워크플로 방향 미니맵/나침반), `/new-window`(새 스레드 안내), `/experimental`(베타 기능 토글 안내)
 - Custom prompts: 저장된 prompt를 `/name KEY=value` 형태로 호출, `$1..$9`, `$ARGUMENTS` 및 named placeholder 지원
 - MCP 서버 병합: ACP 클라이언트가 제공한 MCP 서버(HTTP/stdio)를 codex-rs 설정에 병합
 

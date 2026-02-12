@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::DerefMut,
     path::{Path, PathBuf},
     rc::Rc,
@@ -25,8 +25,13 @@ use agent_client_protocol::{
 use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexThread, RolloutRecorder, ThreadSortKey,
-    config::{Config, set_project_trust_level},
+    config::{
+        Config,
+        edit::{ConfigEdit, ConfigEditsBuilder},
+        set_project_trust_level,
+    },
     error::CodexErr,
+    features::{FEATURES, Feature},
     models_manager::manager::{ModelsManager, RefreshStrategy},
     parse_command::parse_command,
     parse_turn_item,
@@ -41,7 +46,7 @@ use codex_core::{
         PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, SandboxPolicy, SessionSource, StreamErrorEvent, TerminalInteractionEvent,
-        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
@@ -78,12 +83,352 @@ static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_a
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const CONTEXT_OPT_TRIGGER_PERCENT_DEFAULT: i64 = 90;
+const CONTEXT_OPT_TRIGGER_PERCENT_OPTIONS: [i64; 5] = [75, 80, 85, 90, 95];
+const FEATURE_CONFIG_ID_PREFIX: &str = "beta_feature.";
 
 #[derive(Clone, Debug)]
 struct SessionListEntry {
     id: SessionId,
     title: Option<String>,
     updated_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextOptimizationMode {
+    Off,
+    Monitor,
+    Auto,
+}
+
+impl ContextOptimizationMode {
+    fn from_config_value(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "off" => Ok(Self::Off),
+            "monitor" => Ok(Self::Monitor),
+            "auto" => Ok(Self::Auto),
+            _ => Err(Error::invalid_params()
+                .data("Unsupported context optimization mode (expected: off, monitor, auto)")),
+        }
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Monitor => "monitor",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PromptTokenEstimate {
+    text_tokens: i64,
+    embedded_context_tokens: i64,
+    resource_link_tokens: i64,
+    image_tokens: i64,
+    audio_tokens: i64,
+    total_tokens: i64,
+}
+
+impl PromptTokenEstimate {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "text_tokens": self.text_tokens,
+            "embedded_context_tokens": self.embedded_context_tokens,
+            "resource_link_tokens": self.resource_link_tokens,
+            "image_tokens_assumed": self.image_tokens,
+            "audio_tokens_assumed": self.audio_tokens,
+            "total_tokens": self.total_tokens,
+            "notes": [
+                "This is a rough estimate to monitor context pressure",
+                "Image/audio costs are assumption-based and may differ per model",
+            ],
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingAutoCompact {
+    submission_id: String,
+    total_tokens: i64,
+    context_window: Option<i64>,
+    used_percent: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct PlanSnapshotEntry {
+    step: String,
+    status: StepStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlanSnapshot {
+    explanation: Option<String>,
+    items: Vec<PlanSnapshotEntry>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FlowVectorState {
+    analysis: i64,
+    execution: i64,
+    validation: i64,
+    coordination: i64,
+    path: Vec<char>,
+    recent_actions: VecDeque<String>,
+    last_plan: PlanSnapshot,
+}
+
+impl FlowVectorState {
+    fn record_phase(&mut self, phase: char, detail: impl Into<String>) {
+        match phase {
+            'A' => self.analysis += 1,
+            'E' => self.execution += 1,
+            'V' => self.validation += 1,
+            'C' => self.coordination += 1,
+            _ => {}
+        }
+
+        self.path.push(phase);
+        if self.path.len() > 48 {
+            let drop_count = self.path.len().saturating_sub(48);
+            self.path.drain(..drop_count);
+        }
+
+        self.recent_actions.push_back(detail.into());
+        if self.recent_actions.len() > 24 {
+            self.recent_actions.pop_front();
+        }
+    }
+
+    fn record_plan_update(&mut self, explanation: Option<String>, plan: &[PlanItemArg]) {
+        self.last_plan = PlanSnapshot {
+            explanation,
+            items: plan
+                .iter()
+                .map(|item| PlanSnapshotEntry {
+                    step: item.step.clone(),
+                    status: item.status.clone(),
+                })
+                .collect(),
+        };
+        self.record_phase('C', "plan updated");
+    }
+
+    fn path_string(&self) -> String {
+        if self.path.is_empty() {
+            return "(no flow data yet)".to_string();
+        }
+        self.path
+            .iter()
+            .map(char::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn resultant_vector(&self) -> (i64, i64, f64, &'static str, &'static str) {
+        // x-axis: execution (+) <-> coordination (-)
+        // y-axis: analysis (+) <-> validation (-)
+        let x = self.execution - self.coordination;
+        let y = self.analysis - self.validation;
+
+        let magnitude = ((x.pow(2) + y.pow(2)) as f64).sqrt();
+        let direction = flow_direction_from_xy(x, y);
+        let semantic = flow_semantic_from_direction(direction);
+        (x, y, magnitude, direction, semantic)
+    }
+
+    fn render_compass(&self) -> String {
+        let (x, y, magnitude, direction, semantic) = self.resultant_vector();
+        let mut lines = Vec::new();
+        lines.push("Flow compass".to_string());
+        lines.push("  N: Analysis".to_string());
+        lines.push("W: Coordination   +   E: Execution".to_string());
+        lines.push("  S: Validation".to_string());
+        lines.push(format!(
+            "Vector = ({x}, {y}), |v|={magnitude:.2}, heading={direction}"
+        ));
+        lines.push(format!("Semantic heading = {semantic}"));
+        lines.join("\n")
+    }
+
+    fn render_plan_progress(&self) -> String {
+        if self.last_plan.items.is_empty() {
+            return "Plan: no plan updates received yet.".to_string();
+        }
+
+        let pending = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Pending))
+            .count();
+        let in_progress = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::InProgress))
+            .count();
+        let completed = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Completed))
+            .count();
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Plan progress: completed={completed}, in_progress={in_progress}, pending={pending}"
+        ));
+        if let Some(explanation) = &self.last_plan.explanation
+            && !explanation.trim().is_empty()
+        {
+            lines.push(format!("Plan note: {}", explanation.trim()));
+        }
+        for item in &self.last_plan.items {
+            let status = match item.status {
+                StepStatus::Pending => "pending",
+                StepStatus::InProgress => "in_progress",
+                StepStatus::Completed => "completed",
+            };
+            lines.push(format!("- [{status}] {}", item.step));
+        }
+        lines.join("\n")
+    }
+
+    fn render_recent_actions(&self, detail: bool) -> String {
+        if self.recent_actions.is_empty() {
+            return "Recent actions: (none yet)".to_string();
+        }
+        let actions = if detail {
+            self.recent_actions.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.recent_actions
+                .iter()
+                .rev()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        };
+        let mut lines = vec!["Recent actions:".to_string()];
+        lines.extend(actions.into_iter().map(|line| format!("- {line}")));
+        lines.join("\n")
+    }
+}
+
+fn flow_direction_from_xy(x: i64, y: i64) -> &'static str {
+    if x == 0 && y == 0 {
+        return "CENTER";
+    }
+
+    let angle = (y as f64).atan2(x as f64).to_degrees();
+    if (-22.5..22.5).contains(&angle) {
+        "E"
+    } else if (22.5..67.5).contains(&angle) {
+        "NE"
+    } else if (67.5..112.5).contains(&angle) {
+        "N"
+    } else if (112.5..157.5).contains(&angle) {
+        "NW"
+    } else if !(-157.5..157.5).contains(&angle) {
+        "W"
+    } else if (-157.5..-112.5).contains(&angle) {
+        "SW"
+    } else if (-112.5..-67.5).contains(&angle) {
+        "S"
+    } else {
+        "SE"
+    }
+}
+
+fn flow_semantic_from_direction(direction: &str) -> &'static str {
+    match direction {
+        "N" => "analysis-heavy: deep reasoning / problem framing",
+        "NE" => "analysis -> execution: validated implementation momentum",
+        "E" => "execution-heavy: delivery and tool throughput",
+        "SE" => "execution + validation: stabilization and hardening",
+        "S" => "validation-heavy: review, checks, and correctness focus",
+        "SW" => "validation -> coordination: rollback/replan posture",
+        "W" => "coordination-heavy: planning, scoping, and alignment",
+        "NW" => "coordination + analysis: strategy and architecture shaping",
+        _ => "neutral: balanced or insufficient signal",
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContextOptimizationState {
+    mode: ContextOptimizationMode,
+    trigger_percent: i64,
+    last_prompt_estimate: Option<PromptTokenEstimate>,
+    last_token_info: Option<codex_core::protocol::TokenUsageInfo>,
+    pending_auto_compact: Option<PendingAutoCompact>,
+    auto_compact_submission_id: Option<String>,
+    auto_compact_count: usize,
+}
+
+impl Default for ContextOptimizationState {
+    fn default() -> Self {
+        let mode = std::env::var("ACP_CONTEXT_OPT_MODE")
+            .ok()
+            .and_then(|raw| ContextOptimizationMode::from_config_value(raw.trim()).ok())
+            .unwrap_or(ContextOptimizationMode::Off);
+
+        let trigger_percent = std::env::var("ACP_CONTEXT_OPT_TRIGGER_PERCENT")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(CONTEXT_OPT_TRIGGER_PERCENT_DEFAULT)
+            .clamp(50, 99);
+
+        Self {
+            mode,
+            trigger_percent,
+            last_prompt_estimate: None,
+            last_token_info: None,
+            pending_auto_compact: None,
+            auto_compact_submission_id: None,
+            auto_compact_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExperimentalFeatureSpec {
+    id: Feature,
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+    default_enabled: bool,
+}
+
+fn experimental_feature_specs() -> Vec<ExperimentalFeatureSpec> {
+    FEATURES
+        .iter()
+        .filter_map(|spec| {
+            let name = spec.stage.beta_menu_name()?;
+            let description = spec.stage.beta_menu_description()?;
+            Some(ExperimentalFeatureSpec {
+                id: spec.id,
+                key: spec.key,
+                name,
+                description,
+                default_enabled: spec.default_enabled,
+            })
+        })
+        .collect()
+}
+
+fn experimental_feature_config_id(key: &str) -> String {
+    format!("{FEATURE_CONFIG_ID_PREFIX}{key}")
+}
+
+fn parse_experimental_feature_config_id(config_id: &str) -> Option<ExperimentalFeatureSpec> {
+    let key = config_id.strip_prefix(FEATURE_CONFIG_ID_PREFIX)?;
+    experimental_feature_specs()
+        .into_iter()
+        .find(|spec| spec.key == key)
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -442,6 +787,7 @@ struct PromptState {
     submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    completed: bool,
 }
 
 impl PromptState {
@@ -459,14 +805,29 @@ impl PromptState {
             submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            completed: false,
+        }
+    }
+
+    fn new_background(thread: Arc<dyn CodexThreadImpl>, submission_id: String) -> Self {
+        Self {
+            active_command: None,
+            active_web_search: None,
+            thread,
+            event_count: 0,
+            response_tx: None,
+            submission_id,
+            seen_message_deltas: false,
+            seen_reasoning_deltas: false,
+            completed: false,
         }
     }
 
     fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
+        if self.completed {
             return false;
-        };
-        !response_tx.is_closed()
+        }
+        self.response_tx.as_ref().is_none_or(|tx| !tx.is_closed())
     }
 
     #[expect(clippy::too_many_lines)]
@@ -629,6 +990,8 @@ impl PromptState {
                 );
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
+                } else {
+                    self.completed = true;
                 }
             }
             EventMsg::UndoStarted(event) => {
@@ -655,18 +1018,24 @@ impl PromptState {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Err(Error::internal_error().data(json!({ "message": message, "codex_error_info": codex_error_info })))).ok();
+                } else {
+                    self.completed = true;
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
                 info!("Turn aborted: {reason:?}");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
+                } else {
+                    self.completed = true;
                 }
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
+                } else {
+                    self.completed = true;
                 }
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
@@ -1472,6 +1841,12 @@ impl TaskState {
         }
     }
 
+    fn new_background(thread: Arc<dyn CodexThreadImpl>, submission_id: String) -> Self {
+        Self {
+            prompt: PromptState::new_background(thread, submission_id),
+        }
+    }
+
     fn is_active(&self) -> bool {
         self.prompt.is_active()
     }
@@ -1716,6 +2091,10 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Cached session list for /load lookups.
     last_session_list: Vec<SessionListEntry>,
+    /// Context window optimization and auto-compaction controls.
+    context_optimization: ContextOptimizationState,
+    /// Thread monitoring state for plan/progress and flow-direction UX.
+    flow_vector: FlowVectorState,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -1738,6 +2117,8 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             last_sent_config_options: None,
             last_session_list: Vec::new(),
+            context_optimization: ContextOptimizationState::default(),
+            flow_vector: FlowVectorState::default(),
         }
     }
 
@@ -1861,6 +2242,10 @@ impl<A: Auth> ThreadActor<A> {
             // CLI parity: expose common Codex CLI slash commands in ACP clients.
             // Commands that depend on interactive TUI menus are implemented as
             // "show config options" / "print instructions" in this adapter.
+            AvailableCommand::new(
+                "setup",
+                "show a setup wizard for authentication and recommended session settings",
+            ),
             AvailableCommand::new("model", "choose what model and reasoning effort to use"),
             AvailableCommand::new("personality", "choose a communication style for responses"),
             AvailableCommand::new("approvals", "choose what Codex can do without approval"),
@@ -1872,6 +2257,21 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("mcp", "list configured MCP tools"),
             AvailableCommand::new("status", "show current session configuration"),
+            AvailableCommand::new(
+                "new-window",
+                "show instructions for opening a fresh thread window in the client",
+            ),
+            AvailableCommand::new(
+                "monitor",
+                "monitor plan progress, execution trace, and context optimization state",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("optional: detail"),
+            )),
+            AvailableCommand::new(
+                "vector",
+                "show workflow direction minimap and semantic compass",
+            ),
             AvailableCommand::new("new", "start a new chat during a conversation"),
             AvailableCommand::new("resume", "resume a saved chat"),
             AvailableCommand::new("fork", "fork the current chat"),
@@ -2099,6 +2499,69 @@ impl<A: Auth> ThreadActor<A> {
             .description("Choose a communication style for responses"),
         );
 
+        let context_mode = self.context_optimization.mode.as_config_value();
+        options.push(
+            SessionConfigOption::select(
+                "context_optimization_mode",
+                "Context Optimization",
+                context_mode,
+                vec![
+                    SessionConfigSelectOption::new("off", "Off")
+                        .description("Disable proactive context optimization telemetry/actions"),
+                    SessionConfigSelectOption::new("monitor", "Monitor")
+                        .description("Collect context telemetry only; no auto-compaction"),
+                    SessionConfigSelectOption::new("auto", "Auto").description(
+                        "Automatically compact history when context usage crosses threshold",
+                    ),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Other)
+            .description("Controls context-window monitoring and automatic optimization behavior"),
+        );
+
+        let trigger_options = CONTEXT_OPT_TRIGGER_PERCENT_OPTIONS
+            .iter()
+            .map(|percent| {
+                SessionConfigSelectOption::new(percent.to_string(), format!("{percent}%"))
+                    .description(format!(
+                        "Trigger automatic context compaction at or above {percent}% usage"
+                    ))
+            })
+            .collect::<Vec<_>>();
+        options.push(
+            SessionConfigOption::select(
+                "context_optimization_trigger_percent",
+                "Context Trigger Threshold",
+                self.context_optimization.trigger_percent.to_string(),
+                trigger_options,
+            )
+            .category(SessionConfigOptionCategory::Other)
+            .description("Threshold used when Context Optimization is set to Auto"),
+        );
+
+        for spec in experimental_feature_specs() {
+            let current = if self.config.features.enabled(spec.id) {
+                "on"
+            } else {
+                "off"
+            };
+            options.push(
+                SessionConfigOption::select(
+                    experimental_feature_config_id(spec.key),
+                    format!("Beta: {}", spec.name),
+                    current,
+                    vec![
+                        SessionConfigSelectOption::new("on", "On")
+                            .description("Enable this beta capability"),
+                        SessionConfigSelectOption::new("off", "Off")
+                            .description("Disable this beta capability"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::Other)
+                .description(spec.description),
+            );
+        }
+
         Ok(options)
     }
 
@@ -2182,11 +2645,21 @@ impl<A: Auth> ThreadActor<A> {
         config_id: SessionConfigId,
         value: SessionConfigValueId,
     ) -> Result<(), Error> {
-        match config_id.0.as_ref() {
+        let raw_config_id = config_id.0.to_string();
+        match raw_config_id.as_str() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
             "model" => self.handle_set_config_model(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             "personality" => self.handle_set_config_personality(value).await,
+            "context_optimization_mode" => self.handle_set_context_optimization_mode(value).await,
+            "context_optimization_trigger_percent" => {
+                self.handle_set_context_optimization_trigger(value).await
+            }
+            _ if parse_experimental_feature_config_id(&raw_config_id).is_some() => {
+                let spec = parse_experimental_feature_config_id(&raw_config_id)
+                    .ok_or_else(|| Error::invalid_params().data("Unsupported beta feature"))?;
+                self.handle_set_beta_feature(spec, value).await
+            }
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
     }
@@ -2319,6 +2792,230 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    async fn handle_set_context_optimization_mode(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let mode = ContextOptimizationMode::from_config_value(value.0.as_ref())?;
+        self.context_optimization.mode = mode;
+
+        self.client.log_canonical(
+            "acp.context_opt.mode",
+            json!({
+                "mode": mode.as_config_value(),
+            }),
+        );
+
+        Ok(())
+    }
+
+    async fn handle_set_context_optimization_trigger(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let parsed = value
+            .0
+            .as_ref()
+            .parse::<i64>()
+            .map_err(|_| Error::invalid_params().data("Trigger threshold must be a number"))?;
+
+        if !CONTEXT_OPT_TRIGGER_PERCENT_OPTIONS.contains(&parsed) {
+            return Err(Error::invalid_params().data(format!(
+                "Unsupported threshold. Allowed values: {:?}",
+                CONTEXT_OPT_TRIGGER_PERCENT_OPTIONS
+            )));
+        }
+
+        self.context_optimization.trigger_percent = parsed;
+        self.client.log_canonical(
+            "acp.context_opt.trigger_percent",
+            json!({
+                "trigger_percent": parsed,
+            }),
+        );
+        Ok(())
+    }
+
+    async fn handle_set_beta_feature(
+        &mut self,
+        spec: ExperimentalFeatureSpec,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let enabled = match value.0.as_ref() {
+            "on" => true,
+            "off" => false,
+            _ => {
+                return Err(
+                    Error::invalid_params().data("Beta feature values must be one of: on, off")
+                );
+            }
+        };
+
+        let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_profile(self.config.active_profile.as_deref());
+
+        if enabled {
+            self.config.features.enable(spec.id);
+            builder = builder.set_feature_enabled(spec.key, true);
+        } else {
+            self.config.features.disable(spec.id);
+            if spec.default_enabled {
+                builder = builder.set_feature_enabled(spec.key, false);
+            } else {
+                builder = builder.with_edits(vec![ConfigEdit::ClearPath {
+                    segments: vec!["features".to_string(), spec.key.to_string()],
+                }]);
+            }
+        }
+
+        if let Err(err) = builder.apply().await {
+            return Err(Error::internal_error().data(format!(
+                "failed to persist beta feature '{}': {err}",
+                spec.key
+            )));
+        }
+
+        self.client.log_canonical(
+            "acp.beta_feature",
+            json!({
+                "feature": spec.key,
+                "enabled": enabled,
+            }),
+        );
+
+        Ok(())
+    }
+
+    fn render_experimental_features_message(&self) -> String {
+        let specs = experimental_feature_specs();
+        if specs.is_empty() {
+            return "No experimental features are currently exposed for ACP.".to_string();
+        }
+
+        let mut lines = Vec::new();
+        lines.push("Experimental features (ACP)".to_string());
+        lines.push("Toggle these in Config Options (`Beta: ...`).".to_string());
+        lines.push(String::new());
+        for spec in specs {
+            let state = if self.config.features.enabled(spec.id) {
+                "on"
+            } else {
+                "off"
+            };
+            lines.push(format!("- {}: {} ({})", spec.name, state, spec.description));
+        }
+        lines.join("\n")
+    }
+
+    fn render_setup_wizard_message(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("xsfire-camp setup wizard".to_string());
+        lines.push(String::new());
+        lines.push("1) Authentication".to_string());
+        lines.push(
+            "- In most ACP clients (e.g., Zed), authentication happens via the client UI when the agent reports `auth_required`."
+                .to_string(),
+        );
+        lines.push(
+            "- Available methods: ChatGPT login (browser), or API key via environment variables."
+                .to_string(),
+        );
+        lines.push(String::new());
+        lines.push("2) Recommended Config Options (in your client UI)".to_string());
+        lines.push("- Model + Reasoning Effort".to_string());
+        lines.push("- Approval Preset (approvals/permissions)".to_string());
+        lines.push("- Personality (optional)".to_string());
+        lines.push(String::new());
+        lines.push("3) Beta features".to_string());
+        lines.push("- Toggle in Config Options: `Beta: ...`".to_string());
+        lines.push(String::new());
+        lines.push("4) Context window optimization".to_string());
+        lines.push(format!(
+            "- Current mode: {} (trigger {}%)",
+            self.context_optimization.mode.as_config_value(),
+            self.context_optimization.trigger_percent
+        ));
+        lines
+            .push("- Use `/monitor` to observe token usage estimates + plan progress.".to_string());
+        lines.push("- Set `Context Optimization` to `Monitor` or `Auto` if you want telemetry/auto-compaction.".to_string());
+        lines.push(String::new());
+        lines.push("5) UX helpers".to_string());
+        lines.push("- `/monitor detail`: progress + trace + context telemetry".to_string());
+        lines.push("- `/vector`: workflow minimap + semantic compass".to_string());
+        lines.push("- `/new-window`: how to open a fresh thread in your client".to_string());
+        lines.push(String::new());
+        lines.push("Next actions".to_string());
+        lines.push("- Run: `/status`".to_string());
+        lines.push("- Run: `/monitor`".to_string());
+        lines.push("- If needed: open Config Options and adjust settings above.".to_string());
+        lines.join("\n")
+    }
+
+    fn render_monitor_message(&self, detail: bool) -> String {
+        let mut lines = Vec::new();
+        lines.push("Thread monitor".to_string());
+        lines.push(self.flow_vector.render_plan_progress());
+        lines.push(String::new());
+        lines.push(format!(
+            "Context optimization: mode={}, trigger={}%, auto_compact_runs={}",
+            self.context_optimization.mode.as_config_value(),
+            self.context_optimization.trigger_percent,
+            self.context_optimization.auto_compact_count
+        ));
+
+        if let Some(info) = &self.context_optimization.last_token_info {
+            let total = info.total_token_usage.tokens_in_context_window();
+            let context_window = info
+                .model_context_window
+                .or(self.config.model_context_window);
+            if let Some(window) = context_window {
+                let used = if window > 0 {
+                    ((total as f64 / window as f64) * 100.0).round() as i64
+                } else {
+                    0
+                };
+                lines.push(format!(
+                    "Latest context usage: {total}/{window} tokens (~{used}% used)"
+                ));
+            } else {
+                lines.push(format!(
+                    "Latest context usage: {total} tokens (window unknown)"
+                ));
+            }
+        } else {
+            lines.push("Latest context usage: not available yet".to_string());
+        }
+
+        if let Some(estimate) = &self.context_optimization.last_prompt_estimate {
+            lines.push(format!(
+                "Latest prompt estimate: {} tokens (text={}, embedded={}, links={}, image_assumed={}, audio_assumed={})",
+                estimate.total_tokens,
+                estimate.text_tokens,
+                estimate.embedded_context_tokens,
+                estimate.resource_link_tokens,
+                estimate.image_tokens,
+                estimate.audio_tokens
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push(self.flow_vector.render_compass());
+        lines.push(String::new());
+        lines.push(format!("Flow minimap: {}", self.flow_vector.path_string()));
+        lines.push(String::new());
+        lines.push(self.flow_vector.render_recent_actions(detail));
+
+        lines.join("\n")
+    }
+
+    fn render_vector_message(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("Workflow minimap + semantic compass".to_string());
+        lines.push(self.flow_vector.render_compass());
+        lines.push(format!("Flow path: {}", self.flow_vector.path_string()));
+        lines.join("\n")
+    }
+
     async fn models(&self) -> Result<SessionModelState, Error> {
         let mut available_models = Vec::new();
         let config_model = self.get_current_model().await;
@@ -2412,10 +3109,16 @@ impl<A: Auth> ThreadActor<A> {
 
         self.client
             .log_canonical("acp.prompt", summarize_prompt_for_log(&request.prompt));
+        let prompt_estimate = estimate_prompt_tokens(&request.prompt);
+        self.context_optimization.last_prompt_estimate = Some(prompt_estimate.clone());
+        self.client
+            .log_canonical("acp.context_opt.prompt_estimate", prompt_estimate.to_json());
 
         let items = build_prompt_items(request.prompt);
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
+            self.flow_vector
+                .record_phase('C', format!("slash command: /{name}"));
             match name {
                 // CLI parity commands that map to ACP config options / instructions.
                 "model" => {
@@ -2456,11 +3159,32 @@ impl<A: Auth> ThreadActor<A> {
                     return Ok(response_rx);
                 }
                 "experimental" => {
+                    self.maybe_emit_config_options_update().await;
                     self.client
-                        .send_agent_text(
-                            "This CLI command depends on an interactive menu and is not yet supported in ACP.\nIf you have a specific feature you want toggled, say which and we can wire it up."
-                                .to_string(),
-                        )
+                        .send_agent_text(self.render_experimental_features_message())
+                        .await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "setup" => {
+                    self.maybe_emit_config_options_update().await;
+                    self.client
+                        .send_agent_text(self.render_setup_wizard_message())
+                        .await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "monitor" => {
+                    let detail = matches!(rest.trim(), "detail" | "details" | "full");
+                    self.client
+                        .send_agent_text(self.render_monitor_message(detail))
+                        .await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "vector" => {
+                    self.client
+                        .send_agent_text(self.render_vector_message())
                         .await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
@@ -2482,18 +3206,21 @@ impl<A: Auth> ThreadActor<A> {
                         .model_personality
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "auto".to_string());
+                    let (x, y, magnitude, heading, semantic) = self.flow_vector.resultant_vector();
                     self.client
                         .send_agent_text(format!(
-                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}"
+                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}\n- context_optimization: {} (trigger {}%)\n- workflow_vector: ({x}, {y}), |v|={magnitude:.2}, heading={heading}\n- workflow_semantic: {semantic}",
+                            self.context_optimization.mode.as_config_value(),
+                            self.context_optimization.trigger_percent,
                         ))
                         .await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
                 }
-                "new" | "resume" | "fork" | "agent" => {
+                "new" | "new-window" | "resume" | "fork" | "agent" => {
                     self.client
                         .send_agent_text(
-                            "Session/thread switching must be initiated by the ACP client.\nIn Zed, use the Agent Panel thread list to start a new thread or pick a previous session."
+                            "Session/thread switching must be initiated by the ACP client.\nIn Zed, use the Agent Panel thread list (or the + button) to start a new thread, or pick a previous session."
                                 .to_string(),
                         )
                         .await;
@@ -2620,6 +3347,8 @@ impl<A: Auth> ThreadActor<A> {
                 }
             }
         } else {
+            self.flow_vector
+                .record_phase('A', "free-form prompt submitted");
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
@@ -3089,11 +3818,201 @@ impl<A: Auth> ThreadActor<A> {
         }
     }
 
+    fn observe_token_count(&mut self, submission_id: &str, token_count: &TokenCountEvent) {
+        let Some(info) = token_count.info.clone() else {
+            return;
+        };
+
+        self.context_optimization.last_token_info = Some(info.clone());
+        let total_tokens = info.total_token_usage.tokens_in_context_window();
+        let context_window = info
+            .model_context_window
+            .or(self.config.model_context_window);
+        let used_percent = context_window.map(|window| {
+            if window <= 0 {
+                0
+            } else {
+                ((total_tokens as f64 / window as f64) * 100.0).round() as i64
+            }
+        });
+
+        self.client.log_canonical(
+            "acp.context_opt.token_usage",
+            json!({
+                "submission_id": submission_id,
+                "total_tokens": total_tokens,
+                "context_window": context_window,
+                "used_percent": used_percent,
+                "mode": self.context_optimization.mode.as_config_value(),
+                "trigger_percent": self.context_optimization.trigger_percent,
+            }),
+        );
+
+        let should_stage_auto_compact = matches!(
+            self.context_optimization.mode,
+            ContextOptimizationMode::Auto
+        ) && self
+            .context_optimization
+            .auto_compact_submission_id
+            .as_deref()
+            .is_none_or(|id| id != submission_id)
+            && used_percent.is_some_and(|used| used >= self.context_optimization.trigger_percent);
+
+        if should_stage_auto_compact {
+            self.context_optimization.pending_auto_compact = Some(PendingAutoCompact {
+                submission_id: submission_id.to_string(),
+                total_tokens,
+                context_window,
+                used_percent,
+            });
+        }
+    }
+
+    async fn maybe_trigger_auto_compact_after_turn(&mut self, submission_id: &str) {
+        if self
+            .context_optimization
+            .auto_compact_submission_id
+            .as_deref()
+            == Some(submission_id)
+        {
+            self.context_optimization.auto_compact_submission_id = None;
+            self.client.log_canonical(
+                "acp.context_opt.auto_compact_completed",
+                json!({ "submission_id": submission_id }),
+            );
+            self.flow_vector
+                .record_phase('C', "auto compaction completed");
+            return;
+        }
+
+        let Some(pending) = self.context_optimization.pending_auto_compact.clone() else {
+            return;
+        };
+        if pending.submission_id != submission_id {
+            return;
+        }
+        if !matches!(
+            self.context_optimization.mode,
+            ContextOptimizationMode::Auto
+        ) {
+            return;
+        }
+        if self
+            .context_optimization
+            .auto_compact_submission_id
+            .is_some()
+        {
+            return;
+        }
+
+        self.context_optimization.pending_auto_compact = None;
+
+        match self.thread.submit(Op::Compact).await {
+            Ok(auto_submission_id) => {
+                self.context_optimization.auto_compact_submission_id =
+                    Some(auto_submission_id.clone());
+                self.context_optimization.auto_compact_count += 1;
+                self.flow_vector.record_phase(
+                    'C',
+                    format!(
+                        "auto compact triggered at {}% usage",
+                        pending.used_percent.unwrap_or_default()
+                    ),
+                );
+                self.client.log_canonical(
+                    "acp.context_opt.auto_compact_triggered",
+                    json!({
+                        "source_submission_id": submission_id,
+                        "compact_submission_id": auto_submission_id,
+                        "total_tokens": pending.total_tokens,
+                        "context_window": pending.context_window,
+                        "used_percent": pending.used_percent,
+                    }),
+                );
+
+                let auto_submission_id = self
+                    .context_optimization
+                    .auto_compact_submission_id
+                    .clone()
+                    .unwrap_or_default();
+                self.submissions.insert(
+                    auto_submission_id.clone(),
+                    SubmissionState::Task(TaskState::new_background(
+                        self.thread.clone(),
+                        auto_submission_id,
+                    )),
+                );
+            }
+            Err(err) => {
+                warn!("failed to trigger automatic compact: {err}");
+                self.client.log_canonical(
+                    "acp.context_opt.auto_compact_error",
+                    json!({
+                        "source_submission_id": submission_id,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn observe_flow_event(&mut self, msg: &EventMsg) {
+        match msg {
+            EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+                self.flow_vector
+                    .record_plan_update(explanation.clone(), plan.as_slice());
+            }
+            EventMsg::ExecCommandBegin(event) => self
+                .flow_vector
+                .record_phase('E', format!("exec begin: {:?}", event.command)),
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent { invocation, .. }) => {
+                self.flow_vector.record_phase(
+                    'E',
+                    format!("mcp tool: {}.{}", invocation.server, invocation.tool),
+                )
+            }
+            EventMsg::PatchApplyBegin(_) => self.flow_vector.record_phase('E', "apply_patch"),
+            EventMsg::WebSearchBegin(_) => self.flow_vector.record_phase('E', "web search"),
+            EventMsg::AgentReasoning(_) | EventMsg::AgentReasoningRawContent(_) => {
+                self.flow_vector.record_phase('A', "agent reasoning")
+            }
+            EventMsg::EnteredReviewMode(_) | EventMsg::ExitedReviewMode(_) => {
+                self.flow_vector.record_phase('V', "review")
+            }
+            EventMsg::ContextCompacted(_) => {
+                self.flow_vector.record_phase('C', "context compacted")
+            }
+            _ => {}
+        }
+    }
+
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        self.observe_flow_event(&msg);
+        if let EventMsg::TokenCount(token_count) = &msg {
+            self.observe_token_count(&id, token_count);
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
-            submission.handle_event(&self.client, msg).await;
+            submission.handle_event(&self.client, msg.clone()).await;
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
+        }
+
+        match &msg {
+            EventMsg::TurnComplete(_) => {
+                self.maybe_trigger_auto_compact_after_turn(&id).await;
+            }
+            EventMsg::TurnAborted(_) | EventMsg::Error(_) | EventMsg::StreamError(_) => {
+                if self
+                    .context_optimization
+                    .auto_compact_submission_id
+                    .as_deref()
+                    == Some(id.as_str())
+                {
+                    self.context_optimization.auto_compact_submission_id = None;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -3132,6 +4051,51 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             ContentBlock::Audio(..) | ContentBlock::Resource(..) | _ => None,
         })
         .collect()
+}
+
+fn estimate_prompt_tokens(prompt: &[ContentBlock]) -> PromptTokenEstimate {
+    fn estimate_text_tokens(text: &str) -> i64 {
+        // Coarse heuristic for monitoring only: ~4 chars/token.
+        ((text.chars().count() as f64) / 4.0).ceil() as i64
+    }
+
+    let mut estimate = PromptTokenEstimate::default();
+    for block in prompt {
+        match block {
+            ContentBlock::Text(text_block) => {
+                estimate.text_tokens += estimate_text_tokens(&text_block.text);
+            }
+            ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => {
+                let mut token_guess = 12_i64;
+                token_guess += estimate_text_tokens(uri);
+                token_guess += estimate_text_tokens(name);
+                estimate.resource_link_tokens += token_guess;
+            }
+            ContentBlock::Resource(EmbeddedResource {
+                resource:
+                    EmbeddedResourceResource::TextResourceContents(TextResourceContents {
+                        text,
+                        uri,
+                        ..
+                    }),
+                ..
+            }) => {
+                estimate.embedded_context_tokens += estimate_text_tokens(text);
+                estimate.resource_link_tokens += estimate_text_tokens(uri);
+            }
+            // Model-dependent assumptions for visibility only.
+            ContentBlock::Image(_) => estimate.image_tokens += 1024,
+            ContentBlock::Audio(_) => estimate.audio_tokens += 2048,
+            _ => {}
+        }
+    }
+
+    estimate.total_tokens = estimate.text_tokens
+        + estimate.embedded_context_tokens
+        + estimate.resource_link_tokens
+        + estimate.image_tokens
+        + estimate.audio_tokens;
+    estimate
 }
 
 fn summarize_prompt_for_log(prompt: &[ContentBlock]) -> serde_json::Value {
@@ -3807,6 +4771,249 @@ mod tests {
 
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::ListMcpTools]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_monitor_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/monitor".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Thread monitor")),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "monitor command should not submit backend op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vector_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/vector".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Workflow minimap + semantic compass")),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "vector command should not submit backend op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_window_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/new-window".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks.iter().any(|text| text.contains("thread list")),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "new-window command should not submit backend op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_experimental_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/experimental".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Experimental features")),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "experimental command should not submit backend op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_setup_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/setup".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks.iter().any(|text| text.contains("setup wizard")),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(ops.is_empty(), "setup command should not submit backend op");
 
         Ok(())
     }
