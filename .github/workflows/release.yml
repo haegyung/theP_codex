@@ -224,7 +224,7 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork && (secrets.NPM_TOKEN != '' || vars.NPM_OIDC_PUBLISH == '1') }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -270,7 +270,7 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork && (secrets.NPM_TOKEN != '' || vars.NPM_OIDC_PUBLISH == '1') }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
