@@ -149,34 +149,43 @@ impl BackendDriver for GeminiCliDriver {
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = request.session_id.clone();
-        let mut sessions = self.sessions.borrow_mut();
-        let Some(session) = sessions.get_mut(&session_id) else {
-            return Err(Error::resource_not_found(None));
-        };
-
         let user_text = prompt_blocks_to_text(&request.prompt);
         debug!(
             "Gemini prompt (session={session_id:?}) chars={}",
             user_text.len()
         );
 
-        let mut full_prompt = String::new();
-        for (user, assistant) in session.history.iter().rev().take(6).rev() {
+        let (cwd, full_prompt) = {
+            let sessions = self.sessions.borrow();
+            let Some(session) = sessions.get(&session_id) else {
+                return Err(Error::resource_not_found(None));
+            };
+
+            let mut full_prompt = String::new();
+            for (user, assistant) in session.history.iter().rev().take(6).rev() {
+                full_prompt.push_str("User:\n");
+                full_prompt.push_str(user);
+                full_prompt.push_str("\n\nAssistant:\n");
+                full_prompt.push_str(assistant);
+                full_prompt.push_str("\n\n");
+            }
             full_prompt.push_str("User:\n");
-            full_prompt.push_str(user);
-            full_prompt.push_str("\n\nAssistant:\n");
-            full_prompt.push_str(assistant);
-            full_prompt.push_str("\n\n");
+            full_prompt.push_str(&user_text);
+
+            (session.cwd.clone(), full_prompt)
+        };
+
+        let output = self.run_gemini(cwd, full_prompt).await?;
+        let output_text = output.trim_end_matches('\n').to_string();
+        send_agent_text(&session_id, &output_text).await;
+
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            let Some(session) = sessions.get_mut(&session_id) else {
+                return Err(Error::resource_not_found(None));
+            };
+            session.history.push((user_text, output_text));
         }
-        full_prompt.push_str("User:\n");
-        full_prompt.push_str(&user_text);
-
-        let output = self.run_gemini(session.cwd.clone(), full_prompt).await?;
-        send_agent_text(&session_id, output.trim_end_matches('\n')).await;
-
-        session
-            .history
-            .push((user_text, output.trim_end_matches('\n').to_string()));
 
         Ok(PromptResponse::new(StopReason::EndTurn))
     }

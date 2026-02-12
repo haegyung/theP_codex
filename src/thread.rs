@@ -5112,7 +5112,7 @@ mod tests {
             "Verify: run /status and /monitor",
         ] {
             assert!(
-                steps.iter().any(|step| *step == expected),
+                steps.contains(&expected),
                 "expected plan to include step {expected:?}. steps={steps:?}"
             );
         }
@@ -5124,6 +5124,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_canonical_log_correlation_path() -> anyhow::Result<()> {
         let _guard = crate::session_store::ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
@@ -5285,7 +5286,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
         // Safe within this test due to ENV_LOCK serialization.
         unsafe {
-            let _ = std::env::remove_var("ACP_HOME");
+            std::env::remove_var("ACP_HOME");
         }
 
         Ok(())

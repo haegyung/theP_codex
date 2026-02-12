@@ -224,28 +224,46 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork && (secrets.NPM_TOKEN != '' || vars.NPM_OIDC_PUBLISH == '1') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
       id-token: write
 
     steps:
+      - name: Check whether NPM publishing is configured
+        id: publish_config
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+        run: |
+          if [ -n "${NPM_TOKEN:-}" ] || [ "${NPM_OIDC_PUBLISH:-}" = "1" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+            echo "NPM publishing not configured (NPM_TOKEN empty and NPM_OIDC_PUBLISH!=1). Skipping."
+          fi
+
       - name: Setup Node.js
+        if: steps.publish_config.outputs.enabled == '1'
         uses: actions/setup-node@v6
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
       - name: Update npm
+        if: steps.publish_config.outputs.enabled == '1'
         run: npm install -g npm@latest
 
       - name: Download NPM packages
+        if: steps.publish_config.outputs.enabled == '1'
         uses: actions/download-artifact@v5
         with:
           name: npm-packages
           path: npm-packages
 
       - name: Publish platform packages
+        if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -270,33 +288,52 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork && (secrets.NPM_TOKEN != '' || vars.NPM_OIDC_PUBLISH == '1') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
       id-token: write
 
     steps:
+      - name: Check whether NPM publishing is configured
+        id: publish_config
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+        run: |
+          if [ -n "${NPM_TOKEN:-}" ] || [ "${NPM_OIDC_PUBLISH:-}" = "1" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+            echo "NPM publishing not configured (NPM_TOKEN empty and NPM_OIDC_PUBLISH!=1). Skipping."
+          fi
+
       - name: Setup Node.js
+        if: steps.publish_config.outputs.enabled == '1'
         uses: actions/setup-node@v6
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
       - name: Update npm
+        if: steps.publish_config.outputs.enabled == '1'
         run: npm install -g npm@latest
 
       - name: Download base package
+        if: steps.publish_config.outputs.enabled == '1'
         uses: actions/download-artifact@v5
         with:
           name: npm-base-package
           path: npm
 
       - name: Wait for platform packages to be available
+        if: steps.publish_config.outputs.enabled == '1'
         run: |
           echo "Waiting 30 seconds for platform packages to be available on npm..."
           sleep 30
 
       - name: Publish base package
+        if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |

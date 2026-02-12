@@ -52,10 +52,10 @@ pub struct AcpHome;
 
 impl AcpHome {
     pub fn resolve() -> Option<PathBuf> {
-        if let Ok(v) = std::env::var("ACP_HOME") {
-            if !v.trim().is_empty() {
-                return Some(PathBuf::from(v));
-            }
+        if let Ok(v) = std::env::var("ACP_HOME")
+            && !v.trim().is_empty()
+        {
+            return Some(PathBuf::from(v));
         }
         let home = std::env::var("HOME").ok()?;
         if home.trim().is_empty() {
@@ -182,14 +182,14 @@ impl SessionStore {
                 backend_session_id: backend_session_id.clone(),
                 cwd: cwd.map(|p| p.display().to_string()),
             };
-            if let Ok(data) = serde_json::to_string_pretty(&state) {
-                if let Err(e) = std::fs::write(&state_path, data) {
-                    warn!(
-                        "Failed to write session state {}: {}",
-                        state_path.display(),
-                        e
-                    );
-                }
+            if let Ok(data) = serde_json::to_string_pretty(&state)
+                && let Err(e) = std::fs::write(&state_path, data)
+            {
+                warn!(
+                    "Failed to write session state {}: {}",
+                    state_path.display(),
+                    e
+                );
             }
         }
 
@@ -309,7 +309,7 @@ mod tests {
         drop(std::fs::remove_dir_all(&root));
         // Safe within this test due to ENV_LOCK serialization.
         unsafe {
-            let _ = std::env::remove_var("ACP_HOME");
+            std::env::remove_var("ACP_HOME");
         }
     }
 }
