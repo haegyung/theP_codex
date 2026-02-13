@@ -121,6 +121,41 @@ impl ContextOptimizationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskOrchestrationMode {
+    Parallel,
+    Sequential,
+}
+
+impl TaskOrchestrationMode {
+    fn from_config_value(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "parallel" => Ok(Self::Parallel),
+            "sequential" => Ok(Self::Sequential),
+            _ => Err(Error::invalid_params()
+                .data("Unsupported task orchestration mode (expected: parallel, sequential)")),
+        }
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Parallel => "parallel",
+            Self::Sequential => "sequential",
+        }
+    }
+}
+
+fn parse_on_off_toggle(raw: &str, option_name: &str) -> Result<bool, Error> {
+    match raw {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => {
+            Err(Error::invalid_params()
+                .data(format!("{option_name} values must be one of: on, off")))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct PromptTokenEstimate {
     text_tokens: i64,
@@ -390,6 +425,43 @@ impl Default for ContextOptimizationState {
             pending_auto_compact: None,
             auto_compact_submission_id: None,
             auto_compact_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TaskMonitoringState {
+    orchestration_mode: TaskOrchestrationMode,
+    monitor_enabled: bool,
+    vector_check_enabled: bool,
+}
+
+impl Default for TaskMonitoringState {
+    fn default() -> Self {
+        Self {
+            orchestration_mode: TaskOrchestrationMode::Parallel,
+            monitor_enabled: true,
+            vector_check_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SetupWizardProgressState {
+    status_checked: bool,
+    monitor_checked: bool,
+    vector_checked: bool,
+}
+
+impl SetupWizardProgressState {
+    fn verification_status(self) -> StepStatus {
+        let completed_count = usize::from(self.status_checked)
+            + usize::from(self.monitor_checked)
+            + usize::from(self.vector_checked);
+        match completed_count {
+            0 => StepStatus::Pending,
+            3 => StepStatus::Completed,
+            _ => StepStatus::InProgress,
         }
     }
 }
@@ -680,6 +752,18 @@ impl SubmissionState {
             Self::Prompt(state) => state.handle_event(client, event).await,
             Self::Task(state) => state.handle_event(client, event).await,
             Self::OneShot(state) => state.handle_event(client, event).await,
+        }
+    }
+
+    fn monitor_label(&self) -> Option<&'static str> {
+        match self {
+            Self::CustomPrompts(_) => None,
+            Self::Prompt(_) => Some("prompt"),
+            Self::Task(_) => Some("task"),
+            Self::OneShot(state) => Some(match state.kind {
+                OneShotKind::McpTools => "oneshot:mcp",
+                OneShotKind::Skills => "oneshot:skills",
+            }),
         }
     }
 }
@@ -2094,6 +2178,12 @@ struct ThreadActor<A> {
     last_session_list: Vec<SessionListEntry>,
     /// Context window optimization and auto-compaction controls.
     context_optimization: ContextOptimizationState,
+    /// Task-level monitoring defaults and orchestration behavior.
+    task_monitoring: TaskMonitoringState,
+    /// Setup wizard becomes "live" after `/setup` is first invoked.
+    setup_wizard_active: bool,
+    /// Tracks setup verification checks to keep Plan progress accurate.
+    setup_wizard_progress: SetupWizardProgressState,
     /// Thread monitoring state for plan/progress and flow-direction UX.
     flow_vector: FlowVectorState,
 }
@@ -2119,6 +2209,9 @@ impl<A: Auth> ThreadActor<A> {
             last_sent_config_options: None,
             last_session_list: Vec::new(),
             context_optimization: ContextOptimizationState::default(),
+            task_monitoring: TaskMonitoringState::default(),
+            setup_wizard_active: false,
+            setup_wizard_progress: SetupWizardProgressState::default(),
             flow_vector: FlowVectorState::default(),
         }
     }
@@ -2208,13 +2301,27 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::SetMode { mode, response_tx } => {
                 let result = self.handle_set_mode(mode).await;
+                let is_ok = result.is_ok();
                 drop(response_tx.send(result));
-                self.maybe_emit_config_options_update().await;
+                if is_ok {
+                    self.maybe_emit_config_options_update().await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup progress updated from configuration change",
+                    ))
+                    .await;
+                }
             }
             ThreadMessage::SetModel { model, response_tx } => {
                 let result = self.handle_set_model(model).await;
+                let is_ok = result.is_ok();
                 drop(response_tx.send(result));
-                self.maybe_emit_config_options_update().await;
+                if is_ok {
+                    self.maybe_emit_config_options_update().await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup progress updated from configuration change",
+                    ))
+                    .await;
+                }
             }
             ThreadMessage::SetConfigOption {
                 config_id,
@@ -2222,7 +2329,15 @@ impl<A: Auth> ThreadActor<A> {
                 response_tx,
             } => {
                 let result = self.handle_set_config_option(config_id, value).await;
+                let is_ok = result.is_ok();
                 drop(response_tx.send(result));
+                if is_ok {
+                    self.maybe_emit_config_options_update().await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup progress updated from configuration change",
+                    ))
+                    .await;
+                }
             }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
@@ -2540,6 +2655,63 @@ impl<A: Auth> ThreadActor<A> {
             .description("Threshold used when Context Optimization is set to Auto"),
         );
 
+        options.push(
+            SessionConfigOption::select(
+                "task_orchestration_mode",
+                "Task Orchestration",
+                self.task_monitoring.orchestration_mode.as_config_value(),
+                vec![
+                    SessionConfigSelectOption::new("parallel", "Parallel").description(
+                        "Run independent prompt/task flows concurrently (recommended default)",
+                    ),
+                    SessionConfigSelectOption::new("sequential", "Sequential")
+                        .description("Queue prompt/task flows one-by-one"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Other)
+            .description("Controls prompt/task orchestration strategy"),
+        );
+
+        options.push(
+            SessionConfigOption::select(
+                "task_monitoring_enabled",
+                "Task Monitoring",
+                if self.task_monitoring.monitor_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                vec![
+                    SessionConfigSelectOption::new("on", "On")
+                        .description("Track active tasks and expose per-task progress in /monitor"),
+                    SessionConfigSelectOption::new("off", "Off")
+                        .description("Disable task-level monitor reporting"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Other)
+            .description("Enable or disable task-level monitoring"),
+        );
+
+        options.push(
+            SessionConfigOption::select(
+                "task_vector_check_enabled",
+                "Progress Vector Checks",
+                if self.task_monitoring.vector_check_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                vec![
+                    SessionConfigSelectOption::new("on", "On")
+                        .description("Show workflow vector/minimap checks in /monitor"),
+                    SessionConfigSelectOption::new("off", "Off")
+                        .description("Hide workflow vector checks from monitor output"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Other)
+            .description("Enable or disable progress vector checks"),
+        );
+
         for spec in experimental_feature_specs() {
             let current = if self.config.features.enabled(spec.id) {
                 "on"
@@ -2641,6 +2813,18 @@ impl<A: Auth> ThreadActor<A> {
             .await;
     }
 
+    async fn maybe_emit_setup_wizard_plan_update(&mut self, explanation: Option<&str>) {
+        if !self.setup_wizard_active {
+            return;
+        }
+        self.client
+            .update_plan(
+                self.setup_wizard_plan_items(),
+                explanation.map(ToOwned::to_owned),
+            )
+            .await;
+    }
+
     async fn handle_set_config_option(
         &mut self,
         config_id: SessionConfigId,
@@ -2656,6 +2840,9 @@ impl<A: Auth> ThreadActor<A> {
             "context_optimization_trigger_percent" => {
                 self.handle_set_context_optimization_trigger(value).await
             }
+            "task_orchestration_mode" => self.handle_set_task_orchestration_mode(value).await,
+            "task_monitoring_enabled" => self.handle_set_task_monitoring_enabled(value).await,
+            "task_vector_check_enabled" => self.handle_set_task_vector_check_enabled(value).await,
             _ if parse_experimental_feature_config_id(&raw_config_id).is_some() => {
                 let spec = parse_experimental_feature_config_id(&raw_config_id)
                     .ok_or_else(|| Error::invalid_params().data("Unsupported beta feature"))?;
@@ -2837,6 +3024,51 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    async fn handle_set_task_orchestration_mode(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let mode = TaskOrchestrationMode::from_config_value(value.0.as_ref())?;
+        self.task_monitoring.orchestration_mode = mode;
+        self.client.log_canonical(
+            "acp.task_monitoring.orchestration_mode",
+            json!({
+                "mode": mode.as_config_value(),
+            }),
+        );
+        Ok(())
+    }
+
+    async fn handle_set_task_monitoring_enabled(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let enabled = parse_on_off_toggle(value.0.as_ref(), "Task Monitoring")?;
+        self.task_monitoring.monitor_enabled = enabled;
+        self.client.log_canonical(
+            "acp.task_monitoring.enabled",
+            json!({
+                "enabled": enabled,
+            }),
+        );
+        Ok(())
+    }
+
+    async fn handle_set_task_vector_check_enabled(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let enabled = parse_on_off_toggle(value.0.as_ref(), "Progress Vector Checks")?;
+        self.task_monitoring.vector_check_enabled = enabled;
+        self.client.log_canonical(
+            "acp.task_monitoring.vector_checks",
+            json!({
+                "enabled": enabled,
+            }),
+        );
+        Ok(())
+    }
+
     async fn handle_set_beta_feature(
         &mut self,
         spec: ExperimentalFeatureSpec,
@@ -2945,6 +3177,26 @@ impl<A: Auth> ThreadActor<A> {
         );
         lines.push(String::new());
         lines.push("5) UX helpers".to_string());
+        lines.push(format!(
+            "- Task orchestration default: `{}`",
+            self.task_monitoring.orchestration_mode.as_config_value()
+        ));
+        lines.push(format!(
+            "- Task monitoring default: `{}`",
+            if self.task_monitoring.monitor_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        lines.push(format!(
+            "- Progress vector checks default: `{}`",
+            if self.task_monitoring.vector_check_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
         lines.push("- `/monitor detail`: progress + trace + context telemetry".to_string());
         lines.push("- `/vector`: workflow minimap + semantic compass".to_string());
         lines.push("- `/new-window`: how to open a fresh thread in your client".to_string());
@@ -2952,6 +3204,7 @@ impl<A: Auth> ThreadActor<A> {
         lines.push("Next actions".to_string());
         lines.push("- Run: `/status`".to_string());
         lines.push("- Run: `/monitor`".to_string());
+        lines.push("- Run: `/vector`".to_string());
         lines.push("- If needed: open Config Options and adjust settings above.".to_string());
         lines.join("\n")
     }
@@ -3017,18 +3270,97 @@ impl<A: Auth> ThreadActor<A> {
             status: context_status,
         });
 
+        let orchestration_status = if matches!(
+            self.task_monitoring.orchestration_mode,
+            TaskOrchestrationMode::Parallel
+        ) {
+            StepStatus::Completed
+        } else {
+            StepStatus::Pending
+        };
         items.push(PlanItemArg {
-            step: "Verify: run /status and /monitor".to_string(),
-            status: StepStatus::Pending,
+            step: "Defaults: parallel task orchestration".to_string(),
+            status: orchestration_status,
+        });
+
+        let task_monitoring_status = if self.task_monitoring.monitor_enabled {
+            StepStatus::Completed
+        } else {
+            StepStatus::Pending
+        };
+        items.push(PlanItemArg {
+            step: "Defaults: task monitoring mode enabled".to_string(),
+            status: task_monitoring_status,
+        });
+
+        let vector_check_status = if self.task_monitoring.vector_check_enabled {
+            StepStatus::Completed
+        } else {
+            StepStatus::Pending
+        };
+        items.push(PlanItemArg {
+            step: "Defaults: progress vector checks enabled".to_string(),
+            status: vector_check_status,
+        });
+
+        items.push(PlanItemArg {
+            step: "Verify: run /status, /monitor, and /vector".to_string(),
+            status: self.setup_wizard_progress.verification_status(),
         });
 
         items
+    }
+
+    fn render_task_monitoring_snapshot(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Task monitoring: orchestration={}, monitor={}, vector_checks={}",
+            self.task_monitoring.orchestration_mode.as_config_value(),
+            if self.task_monitoring.monitor_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if self.task_monitoring.vector_check_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+
+        if !self.task_monitoring.monitor_enabled {
+            lines.push("Task queue: monitoring disabled".to_string());
+            return lines.join("\n");
+        }
+
+        let mut active_tasks = self
+            .submissions
+            .iter()
+            .filter_map(|(submission_id, state)| {
+                state
+                    .monitor_label()
+                    .and_then(|label| state.is_active().then_some((submission_id.clone(), label)))
+            })
+            .collect::<Vec<_>>();
+        active_tasks.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if active_tasks.is_empty() {
+            lines.push("Task queue: idle".to_string());
+        } else {
+            lines.push(format!("Task queue: {} active", active_tasks.len()));
+            for (submission_id, label) in active_tasks {
+                lines.push(format!("- [in_progress] {label}: {submission_id}"));
+            }
+        }
+        lines.join("\n")
     }
 
     fn render_monitor_message(&self, detail: bool) -> String {
         let mut lines = Vec::new();
         lines.push("Thread monitor".to_string());
         lines.push(self.flow_vector.render_plan_progress());
+        lines.push(String::new());
+        lines.push(self.render_task_monitoring_snapshot());
         lines.push(String::new());
         lines.push(format!(
             "Context optimization: mode={}, trigger={}%, auto_compact_runs={}",
@@ -3073,11 +3405,15 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         lines.push(String::new());
-        lines.push(self.flow_vector.render_compass());
-        lines.push(String::new());
-        lines.push(format!("Flow minimap: {}", self.flow_vector.path_string()));
-        lines.push(String::new());
-        lines.push(self.flow_vector.render_recent_actions(detail));
+        if self.task_monitoring.vector_check_enabled {
+            lines.push(self.flow_vector.render_compass());
+            lines.push(String::new());
+            lines.push(format!("Flow minimap: {}", self.flow_vector.path_string()));
+            lines.push(String::new());
+            lines.push(self.flow_vector.render_recent_actions(detail));
+        } else {
+            lines.push("Progress vector checks are disabled.".to_string());
+        }
 
         lines.join("\n")
     }
@@ -3241,6 +3577,7 @@ impl<A: Auth> ThreadActor<A> {
                     return Ok(response_rx);
                 }
                 "setup" => {
+                    self.setup_wizard_active = true;
                     self.maybe_emit_config_options_update().await;
                     self.client
                         .update_plan(self.setup_wizard_plan_items(), None)
@@ -3252,21 +3589,32 @@ impl<A: Auth> ThreadActor<A> {
                     return Ok(response_rx);
                 }
                 "monitor" => {
+                    self.setup_wizard_progress.monitor_checked = true;
                     let detail = matches!(rest.trim(), "detail" | "details" | "full");
                     self.client
                         .send_agent_text(self.render_monitor_message(detail))
                         .await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup verification progress updated",
+                    ))
+                    .await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
                 }
                 "vector" => {
+                    self.setup_wizard_progress.vector_checked = true;
                     self.client
                         .send_agent_text(self.render_vector_message())
                         .await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup verification progress updated",
+                    ))
+                    .await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
                 }
                 "status" => {
+                    self.setup_wizard_progress.status_checked = true;
                     self.maybe_emit_config_options_update().await;
                     let current_model = self.get_current_model().await;
                     let approval_preset = self
@@ -3286,11 +3634,18 @@ impl<A: Auth> ThreadActor<A> {
                     let (x, y, magnitude, heading, semantic) = self.flow_vector.resultant_vector();
                     self.client
                         .send_agent_text(format!(
-                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}\n- context_optimization: {} (trigger {}%)\n- workflow_vector: ({x}, {y}), |v|={magnitude:.2}, heading={heading}\n- workflow_semantic: {semantic}",
+                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}\n- context_optimization: {} (trigger {}%)\n- task_orchestration: {}\n- task_monitoring: {}\n- progress_vector_checks: {}\n- workflow_vector: ({x}, {y}), |v|={magnitude:.2}, heading={heading}\n- workflow_semantic: {semantic}",
                             self.context_optimization.mode.as_config_value(),
                             self.context_optimization.trigger_percent,
+                            self.task_monitoring.orchestration_mode.as_config_value(),
+                            if self.task_monitoring.monitor_enabled { "on" } else { "off" },
+                            if self.task_monitoring.vector_check_enabled { "on" } else { "off" },
                         ))
                         .await;
+                    self.maybe_emit_setup_wizard_plan_update(Some(
+                        "Setup verification progress updated",
+                    ))
+                    .await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
                 }
@@ -3429,6 +3784,27 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
+            }
+        }
+
+        if matches!(
+            self.task_monitoring.orchestration_mode,
+            TaskOrchestrationMode::Sequential
+        ) {
+            let active_tasks = self
+                .submissions
+                .values()
+                .filter(|state| state.monitor_label().is_some() && state.is_active())
+                .count();
+            if active_tasks > 0 {
+                self.client
+                    .send_agent_text(
+                        "Task orchestration is set to `sequential`. Wait for the current task to finish, or switch `Task Orchestration` to `Parallel`."
+                            .to_string(),
+                    )
+                    .await;
+                drop(response_tx.send(Ok(StopReason::EndTurn)));
+                return Ok(response_rx);
             }
         }
 
@@ -4894,6 +5270,11 @@ mod tests {
                 .any(|text| text.contains("Thread monitor")),
             "notifications don't match {notifications:?}"
         );
+        assert!(
+            text_chunks.iter().any(|text| text
+                .contains("Task monitoring: orchestration=parallel, monitor=on, vector_checks=on")),
+            "monitor output should include task monitoring defaults. notifications={notifications:?}"
+        );
 
         let ops = thread.ops.lock().unwrap();
         assert!(
@@ -5109,7 +5490,10 @@ mod tests {
             "Setup: choose reasoning effort",
             "Setup: choose approval preset",
             "Setup: enable context optimization telemetry",
-            "Verify: run /status and /monitor",
+            "Defaults: parallel task orchestration",
+            "Defaults: task monitoring mode enabled",
+            "Defaults: progress vector checks enabled",
+            "Verify: run /status, /monitor, and /vector",
         ] {
             assert!(
                 steps.contains(&expected),
@@ -5119,6 +5503,82 @@ mod tests {
 
         let ops = thread.ops.lock().unwrap();
         assert!(ops.is_empty(), "setup command should not submit backend op");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_setup_plan_verification_progress_updates() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+
+        async fn send_prompt(
+            message_tx: &UnboundedSender<ThreadMessage>,
+            session_id: &SessionId,
+            prompt: &str,
+        ) -> anyhow::Result<StopReason> {
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec![prompt.into()]),
+                response_tx: prompt_response_tx,
+            })?;
+            Ok(prompt_response_rx.await??.await??)
+        }
+
+        tokio::try_join!(
+            async {
+                assert_eq!(
+                    send_prompt(&message_tx, &session_id, "/setup").await?,
+                    StopReason::EndTurn
+                );
+                assert_eq!(
+                    send_prompt(&message_tx, &session_id, "/status").await?,
+                    StopReason::EndTurn
+                );
+                assert_eq!(
+                    send_prompt(&message_tx, &session_id, "/monitor").await?,
+                    StopReason::EndTurn
+                );
+                assert_eq!(
+                    send_prompt(&message_tx, &session_id, "/vector").await?,
+                    StopReason::EndTurn
+                );
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let plans = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::Plan(plan) => Some(plan),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            plans.len() >= 4,
+            "expected multiple plan updates as setup verification progresses. notifications={notifications:?}"
+        );
+
+        let verify_step = plans
+            .last()
+            .and_then(|plan| {
+                plan.entries
+                    .iter()
+                    .find(|entry| entry.content == "Verify: run /status, /monitor, and /vector")
+            })
+            .expect("expected verify step in latest setup plan");
+
+        assert_eq!(
+            verify_step.status,
+            PlanEntryStatus::Completed,
+            "verify step should be completed after running /status, /monitor, /vector"
+        );
 
         Ok(())
     }

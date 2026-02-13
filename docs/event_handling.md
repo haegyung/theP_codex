@@ -17,3 +17,20 @@
 | `AgentMessage` 및 delta variants | `SessionUpdate::AgentText`/`send_agent_thought` | 모델의 텍스트/추론 출력을 스트리밍하며 text/thought로 재전송합니다. |
 
 `TaskState`는 `PromptState`를 감싸므로 위 이벤트 처리 로직을 그대로 공유합니다. 따라서 `/compact`, `/undo` 등 Task 전용 명령도 beta 기능 관련 이벤트와 매핑된 ACP output을 그대로 받습니다.
+
+## Setup wizard / task monitoring 보강 동작
+
+- `/setup`를 한 번 실행하면 setup wizard plan이 활성화됩니다.
+- 활성화 이후에는 다음 동작이 있을 때 setup plan이 즉시 재발행되어 Progress가 갱신됩니다.
+  - config 변경: `SetMode`, `SetModel`, `SetSessionConfigOption`
+  - 검증 명령 실행: `/status`, `/monitor`, `/vector`
+- setup 검증 단계는 `Verify: run /status, /monitor, and /vector`이며, 실행 상태에 따라 `pending -> in_progress -> completed`로 변합니다.
+
+## Task monitoring 기본값
+
+- 기본 task 모니터링 설정:
+  - `Task Orchestration`: `parallel`
+  - `Task Monitoring`: `on`
+  - `Progress Vector Checks`: `on`
+- `/monitor`는 plan progress 외에 task queue snapshot(활성 task/submission 목록)을 출력합니다.
+- `Task Orchestration`이 `sequential`일 때 활성 task가 있으면 새 task 제출 대신 안내 메시지를 반환합니다.

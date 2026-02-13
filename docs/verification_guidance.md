@@ -14,10 +14,29 @@ cargo test
 
 CIDR–like manual verification steps:
 1. `CODEX_HOME`이 CLI와 동일한지 확인하고, 같은 `threads/`/`rollouts/`/`credentials/` 디렉토리 경로를 사용하세요.
-2. ACP(예: `xsfire-camp`)를 실행하고 `/setup`, `/status`, `/monitor`, `/vector`, `/compact`, `/review`, `/undo`, `/init` 등 slash 명령을 순차적으로 실행합니다.
-3. `logs/codex_chats/<agent>/<timestamp>.md`에 새 turn이 기록되는지 확인하며, 각 turn에서 `Plan`/`ToolCall`/`RequestPermission`이 나오는지 검토합니다.
-4. `docs/event_handling.md`에 정리한 매핑에 따라 각 `EventMsg`(PlanUpdate, ExecCommand*, McpToolCall*, RequestUserInput 등)가 ACP notification으로 나오는지 확인하고, KVS 로그(예: `tracing` 출력)를 참고하세요.
-5. 웹 인터페이스(Zed)를 사용하는 경우, 해당 slash 명령을 실행하면서 Agent Panel에 `Plan`, `Tool Calls`, `Terminal` 탭이 정상적으로 업데이트되는지 보세요.
+2. ACP(예: `xsfire-camp`)를 실행하고 `/setup`를 먼저 실행해 setup wizard plan을 띄웁니다.
+3. `/status` -> `/monitor` -> `/vector` 순서로 실행하고, Plan의 `Verify: run /status, /monitor, and /vector`가 `pending -> in_progress -> completed`로 갱신되는지 확인합니다.
+4. Config Options에서 `Model`, `Reasoning Effort`, `Approval Preset`, `Task Orchestration`, `Task Monitoring`, `Progress Vector Checks` 중 하나를 변경하고, Plan progress가 즉시 반영되는지 확인합니다.
+5. `/monitor` 출력에 다음이 보이는지 확인합니다.
+   - `Task monitoring: orchestration=..., monitor=..., vector_checks=...`
+   - 활성 task가 있으면 `Task queue: N active` 및 항목 목록
+6. `Task Orchestration`을 `sequential`로 바꾼 뒤 task가 진행 중일 때 새 요청을 보내, 즉시 대기 안내 메시지가 나오는지 확인합니다.
+7. `logs/codex_chats/<agent>/<timestamp>.md`에 새 turn이 기록되는지 확인하며, 각 turn에서 `Plan`/`ToolCall`/`RequestPermission`이 나오는지 검토합니다.
+8. `docs/event_handling.md`에 정리한 매핑에 따라 각 `EventMsg`(PlanUpdate, ExecCommand*, McpToolCall*, RequestUserInput 등)가 ACP notification으로 나오는지 확인하고, KVS 로그(예: `tracing` 출력)를 참고하세요.
+9. 웹 인터페이스(Zed)를 사용하는 경우, slash 명령을 실행하면서 Agent Panel의 `Plan`, `Tool Calls`, `Terminal` 탭이 정상적으로 업데이트되는지 보세요.
+
+### 실행 스크립트(체크리스트 리포트 생성)
+
+```bash
+scripts/manual_verification_setup_monitor.sh
+```
+
+- 실행 결과로 `logs/manual_verification/setup_monitor_<timestamp>.md` 리포트가 생성됩니다.
+- 자동 게이트를 건너뛰고 체크리스트만 생성하려면:
+
+```bash
+scripts/manual_verification_setup_monitor.sh --skip-gates
+```
 
 ## 3. 로그/도구 호출 확인
 

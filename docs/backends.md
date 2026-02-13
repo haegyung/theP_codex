@@ -40,3 +40,14 @@ This keeps the ACP request/response shapes stable while allowing internal backen
 Codex uses `CODEX_HOME`. For other backends, use a backend-specific home directory (for example `~/.acp/<backend>` or an env var like `<BACKEND>_HOME`) so sessions do not collide and behavior stays predictable.
 
 In addition, this project can write a backend-agnostic canonical log under `ACP_HOME` (default: `~/.acp`). This enables cross-backend continuity without forcing vendors to share one native session format. See `docs/session_store.md`.
+
+## Session Monitoring Defaults (codex backend)
+
+For codex-backed sessions, task monitoring defaults are:
+
+- `Task Orchestration`: `parallel`
+- `Task Monitoring`: `on`
+- `Progress Vector Checks`: `on`
+
+These are exposed as session config options and can be changed at runtime.
+When `/setup` has been invoked, setup plan progress is refreshed immediately on config changes and on `/status`, `/monitor`, `/vector`.

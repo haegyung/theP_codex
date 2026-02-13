@@ -20,7 +20,10 @@ Use this checklist before tagging/publishing the extension release.
    - [x] GitHub Release `vX.Y.Z` created.
    - [x] Additional target assets (`darwin-*`, `linux-*`, `windows-*`) uploaded.
 5. **Manual verification**
-   - [ ] Launch ACP with `CODEX_HOME` pointing to CLI home and run `/review`, `/compact`, `/undo`.
+   - [ ] Launch ACP with `CODEX_HOME` pointing to CLI home and run `/setup` first.
+   - [ ] Run `/status` -> `/monitor` -> `/vector` and verify setup plan step `Verify: run /status, /monitor, and /vector` reaches `completed`.
+   - [ ] Change one config option (`Model`, `Approval Preset`, or task monitoring options) and confirm Plan progress updates immediately.
+   - [ ] Confirm `/monitor` shows task snapshot (`Task monitoring: ...`, `Task queue: ...`).
    - [ ] Inspect `logs/codex_chats/...` for `Plan`, `ToolCall`, and `RequestPermission` entries.
    - [ ] (Optional) Verify canonical log under `ACP_HOME` (default `~/.acp`) is created and appends `canonical.jsonl`.
    - [ ] Confirm Zed agent panel (if available) shows plan/tool call updates as expected.
