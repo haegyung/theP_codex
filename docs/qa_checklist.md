@@ -45,3 +45,8 @@ Mark each step when complete and keep the checklist with the release notes for t
   - 버튼/입력 렌더 상태(기본/호버/비활성) 확인
   - `Tab` 포커스에서 outline/강조가 `--ms-focus-*`로 표시되는지 확인
   - 테마 전환 시 토큰 스와치(`brand-background`, `surface-card`, `focus-color`) 값이 반영되는지 확인
+- [ ] `docs/design-system/fluent-react-demo.tsx` smoke check:
+  - `FluentReactDemoApp`이 `fluent-react-demo-root`에 React 마운트 되는지 확인
+  - `MsDialog` 오픈/클로즈가 `open` 상태 전환으로 동작하는지 확인
+  - `MsButton/MsInput` 상호작용(기본/호버/비활성/포커스) 및 토큰 반영 확인
+  - 다크/고대비/라이트 전환 시 `data-ms-theme` 기준 토큰이 즉시 반영되는지 확인
