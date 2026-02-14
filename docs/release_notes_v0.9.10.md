@@ -25,6 +25,8 @@
   - Manifest version and release archive URLs updated to `0.9.10`.
 - `extensions/xsfire-camp/manifest.toml`
   - Manifest version and release archive URLs updated to `0.9.10`.
+- `extension.toml` / `extensions/xsfire-camp/manifest.toml`
+  - SHA256 checksums refreshed against the `v0.9.10` GitHub release artifacts.
 
 ## Tests
 - `cargo test`

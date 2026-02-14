@@ -12,30 +12,30 @@ icon = "icons/xsfire-camp.svg"
 
 [agent_servers.xsfire_camp.targets.darwin-aarch64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-aarch64-apple-darwin.tar.gz"
-sha256 = "b81a1aac30bf04e8129931509f5f1c99d85313c80316784c8d92dadef88dbb82"
+sha256 = "a976892654138f7749bd5903fa3a62f01ee2ea2341a0dbab26cd854573179428"
 cmd = "./xsfire-camp"
 
 [agent_servers.xsfire_camp.targets.darwin-x86_64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-x86_64-apple-darwin.tar.gz"
-sha256 = "269a4e843a3f86c418d650dfd12f259d51d07121674eb306237db8617f32ee95"
+sha256 = "5b08c4111bc8f5e67eb12c64b740efc4c1af39dd510ddbd027ef0c0dd7d36c59"
 cmd = "./xsfire-camp"
 
 [agent_servers.xsfire_camp.targets.linux-x86_64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-x86_64-unknown-linux-gnu.tar.gz"
-sha256 = "3e2d93ef8486e8ff9bf5066171542760c695489c8a1d6545708e5832392ba390"
+sha256 = "6a426ab88552e8cd2eb02067986a213b2b1433fb32b95af8d22a96d9e2f920bc"
 cmd = "./xsfire-camp"
 
 [agent_servers.xsfire_camp.targets.linux-aarch64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-aarch64-unknown-linux-gnu.tar.gz"
-sha256 = "96733e8e181a5706814e68b284822bfdef93ce6fc86aa05e33ab74fbdc417218"
+sha256 = "ea4c6550a7728e7f46d356734fcea54d1591a0d072454f313e162331a7a3a306"
 cmd = "./xsfire-camp"
 
 [agent_servers.xsfire_camp.targets.windows-x86_64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-x86_64-pc-windows-msvc.zip"
-sha256 = "d58f6fd99e2ade3ae284d42cd1436ccd1a6c46cbd10fcb256c563a1b7743c8ac"
+sha256 = "e39fbb695560cd1c3e88aee9dde4b891017ef1c9cd13ee73809c46ecefdedf1e"
 cmd = "xsfire-camp.exe"
 
 [agent_servers.xsfire_camp.targets.windows-aarch64]
 archive = "https://github.com/haegyung/xsfire-camp/releases/download/v0.9.10/xsfire-camp-0.9.10-aarch64-pc-windows-msvc.zip"
-sha256 = "29af81ceadbdea580454bba3e8f96008d47fa7abecb370ea4d641ef65bfa2967"
+sha256 = "397b4825643f1d80a60d765394fb50e89cb8e41d4f0bd39894cb7377e2903e0e"
 cmd = "xsfire-camp.exe"
