@@ -39,17 +39,38 @@
 ```md
 ## xsfire-camp v0.9.8
 
-### Why
-When replaying prior session tool calls, namespaced tool names such as `functions.shell_command` and `functions.apply_patch` were not matching existing handler conditions, producing incorrect or missing tool-call rendering.
+### Why this release
+In replayed sessions, tool calls containing namespaced names (for example `functions.shell_command` and `functions.apply_patch`) did not match dispatch branches. This caused `"tool call not found"` behavior or inconsistent fallback handling when restoring prior conversations.
 
-### What’s included
-- Fixed namespaced tool-name handling in replay (`FunctionCall`/`CustomToolCall`).
-- Kept shell/parsing behavior intact for non-prefixed tool names.
-- Added regression tests covering namespaced replay cases.
+### What changed
+- Fixed namespaced tool-call normalization in `src/thread.rs`.
+- Applied normalization in both replay paths:
+  - `ResponseItem::FunctionCall`
+  - `ResponseItem::CustomToolCall`
+- Kept handling for legacy/non-namespaced tool names unchanged.
+- Updated release metadata/version lockstep:
+  - `Cargo.toml` → `0.9.8`
+  - `npm/package.json` / optional dependency pins → `0.9.8`
+  - `Cargo.lock` root package version → `0.9.8`
+- Tag created and pushed: `v0.9.8`
 
 ### Validation
-- `cargo test -q`
-- Releasing tag: `v0.9.8`
+- `cargo test -q`  
+  - `30 passed; 0 failed`
+- New regression tests:
+  - `test_normalize_tool_name`
+  - `test_replay_history_normalizes_namespaced_custom_tool_name`
+  - `test_replay_history_normalizes_namespaced_function_tool_name`
+
+### Notes
+- Merge/rollback:
+  - Rollforward is safe via normal mainline release process.
+  - No breaking behavioral changes are expected for normal un-namespaced tool calls.
+
+### Commit trace
+- `d2243b8` — `fix: normalize namespaced tool calls`
+- `14b2ea4` — `chore: sync Cargo.lock version`
+- `f4c221c` — `docs: add v0.9.8 release notes template and workflow trigger checklist`
 ```
 
 ## `.github/workflows/release.yml` Trigger Check
