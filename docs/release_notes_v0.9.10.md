@@ -2,7 +2,8 @@
 
 ## Release Summary
 - Added a new `monitor` retrospective reporting mode that outputs a structured, lane-based status format with progress ticks, risks/blockers, and next actions.
-- Synced release manifests and package versions to `0.9.10` across core Rust and npm metadata.
+  - Synced release manifests and package versions to `0.9.10` across core Rust and npm metadata.
+  - Finalized `v0.9.10` release artifacts and notes alignment after queue-mode refinements.
 
 ## What’s Changed
 
@@ -38,10 +39,12 @@
 
 ## Versioning / Packaging
 - Tag: `v0.9.10` (published on GitHub Release).
-- Commit history since `v0.9.9`: `6012948`, `83edaf0`, `7e0c885`, `8ada25b`.
+- Commit history since `v0.9.9`: `6012948`, `83edaf0`, `7e0c885`, `8ada25b`, `08b690b`, `f819b03`.
 
 ## Traceability
 - `feat: add monitor retrospective reporting mode` — `83edaf0`
 - `chore: sync 0.9.9 manifests and checksums` — `6012948`
 - `chore: bump version to 0.9.10` — `7e0c885`
 - `chore: refresh v0.9.10 release checksums` — `8ada25b`
+- `feat: add task monitoring auto config mode` — `08b690b`
+- `feat: enforce auto task monitoring queue behavior` — `f819b03`
