@@ -165,7 +165,62 @@
 - 모션은 축소 모드 지원
   - `prefers-reduced-motion: reduce` 경로에서 duration을 0 또는 최소화
 
-## 5. 릴리즈/운영 체크
+## 5. 문서-런타임 추적성(Traceability) 체크 필드
+
+스키마 변경 또는 렌더 적용 시, 문서와 실제 렌더 결과(`fluent-demo.html`, `fluent-react-demo.tsx`)의 연결을 강제하려면 최소한 아래 항목을 남긴다.
+
+필수 필드:
+- `traceId`: 추적 식별자(예: `MSF-TR-001`)
+- `artifact`: 검증 대상(예: `fluent-demo.html`, `fluent-react-demo.tsx`)
+- `component`: 대상 컴포넌트(`MsButton`, `MsInput`, `MsDialog`, `MsCard`)
+- `selector`: HTML/React 렌더 검증용 선택자 또는 앵커
+- `tokenRef`: 근거가 되는 토큰(`--ms-*`)
+- `renderMode`: `static-html` 또는 `react-render`
+- `checks`: 상태별 체크 항목 배열
+- `owner`: 담당자/담당 에이전트
+- `updatedAt`: 마지막 갱신 일시
+
+권장 예시(JSON):
+
+```json
+{
+  "traceId": "MSF-TR-001",
+  "artifact": "docs/design-system/fluent-demo.html",
+  "component": "MsButton",
+  "selector": "main .ms-fluent-card button.ms-fluent-button",
+  "tokenRef": ["--ms-button-bg-rest", "--ms-button-bg-hover", "--ms-button-bg-pressed", "--ms-focus-color"],
+  "renderMode": "static-html",
+  "checks": [
+    "light/dark/highContrast 테마 전환 시 배경/텍스트 대비 변경",
+    "hover/active 상태에서 tokenized 색상 변경",
+    "focus ring이 --ms-focus-color 기준"
+  ],
+  "owner": "design-system",
+  "updatedAt": "2026-02-14"
+}
+```
+
+샘플2(JSON):
+
+```json
+{
+  "traceId": "MSF-TR-002",
+  "artifact": "docs/design-system/fluent-react-demo.tsx",
+  "component": "MsDialog",
+  "selector": "React mount: MsDialog.open === true",
+  "tokenRef": ["--ms-dialog-bg", "--ms-dialog-backdrop", "--ms-color-surface-border"],
+  "renderMode": "react-render",
+  "checks": [
+    "open 상태에서 ms-fluent-dialog 렌더",
+    "ms-fluent-dialog-backdrop 적용",
+    "닫기 버튼 동작 및 keypress-close 경로"
+  ],
+  "owner": "design-system",
+  "updatedAt": "2026-02-14"
+}
+```
+
+## 6. 릴리즈/운영 체크
 
 1. 토큰 변경 시 최소 1개 버전 커밋(major/minor/patch 정책)
 2. 변경된 토큰과 실제 렌더 샘플 간 차이를 스냅샷으로 캡처
