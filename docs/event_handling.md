@@ -33,4 +33,5 @@
   - `Task Monitoring`: `on`
   - `Progress Vector Checks`: `on`
 - `/monitor`는 plan progress 외에 task queue snapshot(활성 task/submission 목록)을 출력합니다.
+- `/monitor retro`는 회고형 상태 보고서(레인별 진행률/리스크/다음 작업)를 텍스트로 출력합니다.
 - `Task Orchestration`이 `sequential`일 때 활성 task가 있으면 새 task 제출 대신 안내 메시지를 반환합니다.

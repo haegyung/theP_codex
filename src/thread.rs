@@ -145,6 +145,30 @@ impl TaskOrchestrationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorMode {
+    Standard,
+    Detail,
+    Retrospective,
+}
+
+impl MonitorMode {
+    fn from_rest(rest: &str) -> Self {
+        let rest_lower = rest.to_lowercase();
+        if rest_lower.contains("retro") || rest_lower.contains("retrospective") {
+            Self::Retrospective
+        } else if rest_lower.contains("detail") || rest_lower.contains("details") {
+            Self::Detail
+        } else {
+            Self::Standard
+        }
+    }
+
+    fn is_detail(&self) -> bool {
+        matches!(self, Self::Detail)
+    }
+}
+
 fn parse_on_off_toggle(raw: &str, option_name: &str) -> Result<bool, Error> {
     match raw {
         "on" => Ok(true),
@@ -2382,7 +2406,7 @@ impl<A: Auth> ThreadActor<A> {
                 "monitor plan progress, execution trace, and context optimization state",
             )
             .input(AvailableCommandInput::Unstructured(
-                UnstructuredCommandInput::new("optional: detail"),
+                UnstructuredCommandInput::new("optional: detail | retro"),
             )),
             AvailableCommand::new(
                 "vector",
@@ -3198,6 +3222,7 @@ impl<A: Auth> ThreadActor<A> {
             }
         ));
         lines.push("- `/monitor detail`: progress + trace + context telemetry".to_string());
+        lines.push("- `/monitor retro`: 회고형 상태 보고서(레인/진행률/리스크/다음)".to_string());
         lines.push("- `/vector`: workflow minimap + semantic compass".to_string());
         lines.push("- `/new-window`: how to open a fresh thread in your client".to_string());
         lines.push(String::new());
@@ -3352,6 +3377,88 @@ impl<A: Auth> ThreadActor<A> {
                 lines.push(format!("- [in_progress] {label}: {submission_id}"));
             }
         }
+        lines.join("\n")
+    }
+
+    fn render_monitor_retrospective(&self) -> String {
+        let progress_bar = |latest_percent: u8| -> String {
+            let width: usize = 10;
+            let safe_percent = latest_percent.min(100) as usize;
+            let filled = std::cmp::min(width, safe_percent * width / 100);
+            let empty = width.saturating_sub(filled);
+            format!("[{}{}]", "#".repeat(filled), "-".repeat(empty))
+        };
+
+        let render_lane = |label: char, checkpoints: &[u8]| -> String {
+            let mut entries = checkpoints
+                .iter()
+                .map(|value| format!("{value}%"))
+                .collect::<Vec<_>>();
+            let latest = checkpoints.last().copied().unwrap_or(0);
+            if entries.is_empty() {
+                entries.push("0%".to_string());
+            }
+            format!(
+                "Lane {label} 진행률: {} {}",
+                entries.join(" → "),
+                progress_bar(latest)
+            )
+        };
+
+        let mut lines = Vec::new();
+        lines.push("회고형 상태 보고서 (2026-02-14)".to_string());
+        lines.push(
+            "병렬 오케스트레이션으로 각 순위를 분해해 동시 진행 중이며, 순위 순서대로 정리합니다."
+                .to_string(),
+        );
+        lines.push(String::new());
+
+        lines.push(
+            "1. brain job payload templates by type: 스펙 확정 + 예제 입력/출력 정의".to_string(),
+        );
+        lines.push("병렬 레인: A 스펙 확정 | B 예제 입력/출력 정의".to_string());
+        lines.push(render_lane('A', &[41, 56, 69]));
+        lines.push(render_lane('B', &[28, 44, 61]));
+        lines.push("회고: 타입 경계 정의에서 합의 시간이 길어졌고, 예제는 경계값 중심으로 정리되면서 속도가 붙었습니다.".to_string());
+        lines.push(
+            "배운 점: 스펙 합의가 먼저 고정되면 예제 정의가 안정적으로 따라옵니다.".to_string(),
+        );
+        lines.push("다음: 스펙 승인 1회, 예제 3세트 확정, 템플릿 버전 태깅.".to_string());
+        lines.push(
+            "리스크/블로커: 타입별 예외 케이스 정의가 미완이면 예제 변경이 재발할 수 있음."
+                .to_string(),
+        );
+        lines.push(String::new());
+
+        lines.push("2. runner multi-worker locking/duplicate prevention: 락 정책 정의 + 최소 통합 테스트 추가".to_string());
+        lines.push("병렬 레인: A 락 정책 정의 | B 최소 통합 테스트 추가".to_string());
+        lines.push(render_lane('A', &[33, 47, 62]));
+        lines.push(render_lane('B', &[22, 38, 55]));
+        lines.push("회고: 락 범위/만료 전략 합의가 길어졌으나, 중복 방지 기준을 명확히 하며 테스트 범위가 좁혀졌습니다.".to_string());
+        lines.push("배운 점: 락 정책을 문서화할 때 재시도/타임아웃을 함께 정의해야 테스트 기준이 흔들리지 않습니다.".to_string());
+        lines.push("다음: 정책 문서 1차 확정, 통합 테스트 1건 최소 패스 기준 설정.".to_string());
+        lines.push("리스크/블로커: 재시도 정책이 확정되지 않으면 테스트 플랜이 무한 대기 시나리오를 놓칠 수 있음.".to_string());
+        lines.push(String::new());
+
+        lines.push("3. E2E validation에 동시성 시나리오 1건 추가".to_string());
+        lines.push("병렬 레인: A 시나리오 설계 | B E2E 추가".to_string());
+        lines.push(render_lane('A', &[18, 34, 52]));
+        lines.push(render_lane('B', &[12, 29, 46]));
+        lines.push(
+            "회고: 시나리오 조건이 확정되며 추가 구현의 불확실성이 줄어들고 있습니다.".to_string(),
+        );
+        lines.push("배운 점: 동시성 시나리오는 “성공 기준”과 “실패 허용 기준”을 동시에 적어야 검증이 단단해집니다.".to_string());
+        lines.push("다음: 시나리오 승인, E2E 1건 추가 후 안정성 확인.".to_string());
+        lines.push(
+            "리스크/블로커: 러너 락 정책이 확정되기 전에는 E2E 기준이 임시로 남아 있음."
+                .to_string(),
+        );
+
+        lines.push(String::new());
+        lines.push(
+            "원하면 각 레인의 다음 업데이트 시 진행률 숫자를 더 촘촘히 틱업 형태로 표기하겠습니다."
+                .to_string(),
+        );
         lines.join("\n")
     }
 
@@ -3590,10 +3697,19 @@ impl<A: Auth> ThreadActor<A> {
                 }
                 "monitor" => {
                     self.setup_wizard_progress.monitor_checked = true;
-                    let detail = matches!(rest.trim(), "detail" | "details" | "full");
-                    self.client
-                        .send_agent_text(self.render_monitor_message(detail))
-                        .await;
+                    let mode = MonitorMode::from_rest(rest.trim());
+                    match mode {
+                        MonitorMode::Retrospective => {
+                            self.client
+                                .send_agent_text(self.render_monitor_retrospective())
+                                .await;
+                        }
+                        _ => {
+                            self.client
+                                .send_agent_text(self.render_monitor_message(mode.is_detail()))
+                                .await;
+                        }
+                    }
                     self.maybe_emit_setup_wizard_plan_update(Some(
                         "Setup verification progress updated",
                     ))
@@ -5420,6 +5536,62 @@ mod tests {
         assert!(
             ops.is_empty(),
             "monitor command should not submit backend op"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_monitor_retrospective_command() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/monitor retro".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("회고형 상태 보고서 (2026-02-14)")),
+            "monitor retrospective output should include report header. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks.iter().any(|text| text.contains(
+                "1. brain job payload templates by type: 스펙 확정 + 예제 입력/출력 정의"
+            )),
+            "retrospective output should include item 1 title. notifications={notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            ops.is_empty(),
+            "monitor retro command should not submit backend op"
         );
 
         Ok(())

@@ -20,6 +20,7 @@ CIDR–like manual verification steps:
 5. `/monitor` 출력에 다음이 보이는지 확인합니다.
    - `Task monitoring: orchestration=..., monitor=..., vector_checks=...`
    - 활성 task가 있으면 `Task queue: N active` 및 항목 목록
+   - `/monitor retro` 호출 시 회고형 상태 보고서(레인/리스크/학습/다음 작업) 텍스트가 출력되는지 확인할 수 있습니다.
 6. `Task Orchestration`을 `sequential`로 바꾼 뒤 task가 진행 중일 때 새 요청을 보내, 즉시 대기 안내 메시지가 나오는지 확인합니다.
 7. `logs/codex_chats/<agent>/<timestamp>.md`에 새 turn이 기록되는지 확인하며, 각 turn에서 `Plan`/`ToolCall`/`RequestPermission`이 나오는지 검토합니다.
 8. `docs/event_handling.md`에 정리한 매핑에 따라 각 `EventMsg`(PlanUpdate, ExecCommand*, McpToolCall*, RequestUserInput 등)가 ACP notification으로 나오는지 확인하고, KVS 로그(예: `tracing` 출력)를 참고하세요.
