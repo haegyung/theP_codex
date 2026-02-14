@@ -16,7 +16,7 @@ CIDR–like manual verification steps:
 1. `CODEX_HOME`이 CLI와 동일한지 확인하고, 같은 `threads/`/`rollouts/`/`credentials/` 디렉토리 경로를 사용하세요.
 2. ACP(예: `xsfire-camp`)를 실행하고 `/setup`를 먼저 실행해 setup wizard plan을 띄웁니다.
 3. `/status` -> `/monitor` -> `/vector` 순서로 실행하고, Plan의 `Verify: run /status, /monitor, and /vector`가 `pending -> in_progress -> completed`로 갱신되는지 확인합니다.
-4. Config Options에서 `Model`, `Reasoning Effort`, `Approval Preset`, `Task Orchestration`, `Task Monitoring`, `Progress Vector Checks` 중 하나를 변경하고, Plan progress가 즉시 반영되는지 확인합니다.
+4. Config Options에서 `Model`, `Reasoning Effort`, `Approval Preset`, `Task Orchestration`, `Task Monitoring`(`on/auto/off`), `Progress Vector Checks` 중 하나를 변경하고, Plan progress가 즉시 반영되는지 확인합니다.
 5. `/monitor` 출력에 다음이 보이는지 확인합니다.
    - `Task monitoring: orchestration=..., monitor=..., vector_checks=...`
    - 활성 task가 있으면 `Task queue: N active` 및 항목 목록

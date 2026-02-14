@@ -46,7 +46,7 @@ In addition, this project can write a backend-agnostic canonical log under `ACP_
 For codex-backed sessions, task monitoring defaults are:
 
 - `Task Orchestration`: `parallel`
-- `Task Monitoring`: `on`
+- `Task Monitoring`: `on` (optionally `auto` or `off`)
 - `Progress Vector Checks`: `on`
 
 These are exposed as session config options and can be changed at runtime.

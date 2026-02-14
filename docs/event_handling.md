@@ -30,7 +30,7 @@
 
 - 기본 task 모니터링 설정:
   - `Task Orchestration`: `parallel`
-  - `Task Monitoring`: `on`
+  - `Task Monitoring`: `on` (또는 `auto`, `off`)
   - `Progress Vector Checks`: `on`
 - `/monitor`는 plan progress 외에 task queue snapshot(활성 task/submission 목록)을 출력합니다.
 - `/monitor retro`는 회고형 상태 보고서(레인별 진행률/리스크/다음 작업)를 텍스트로 출력합니다.

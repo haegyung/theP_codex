@@ -146,6 +146,37 @@ impl TaskOrchestrationMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskMonitoringMode {
+    On,
+    Auto,
+    Off,
+}
+
+impl TaskMonitoringMode {
+    fn from_config_value(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "on" => Ok(Self::On),
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            _ => Err(Error::invalid_params()
+                .data("Task Monitoring values must be one of: on, auto, off")),
+        }
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorMode {
     Standard,
     Detail,
@@ -456,7 +487,7 @@ impl Default for ContextOptimizationState {
 #[derive(Clone, Debug)]
 struct TaskMonitoringState {
     orchestration_mode: TaskOrchestrationMode,
-    monitor_enabled: bool,
+    monitor_mode: TaskMonitoringMode,
     vector_check_enabled: bool,
 }
 
@@ -464,7 +495,7 @@ impl Default for TaskMonitoringState {
     fn default() -> Self {
         Self {
             orchestration_mode: TaskOrchestrationMode::Parallel,
-            monitor_enabled: true,
+            monitor_mode: TaskMonitoringMode::On,
             vector_check_enabled: true,
         }
     }
@@ -2700,14 +2731,12 @@ impl<A: Auth> ThreadActor<A> {
             SessionConfigOption::select(
                 "task_monitoring_enabled",
                 "Task Monitoring",
-                if self.task_monitoring.monitor_enabled {
-                    "on"
-                } else {
-                    "off"
-                },
+                self.task_monitoring.monitor_mode.as_config_value(),
                 vec![
                     SessionConfigSelectOption::new("on", "On")
                         .description("Track active tasks and expose per-task progress in /monitor"),
+                    SessionConfigSelectOption::new("auto", "Auto")
+                        .description("Monitor task queue automatically while active tasks exist"),
                     SessionConfigSelectOption::new("off", "Off")
                         .description("Disable task-level monitor reporting"),
                 ],
@@ -2865,7 +2894,7 @@ impl<A: Auth> ThreadActor<A> {
                 self.handle_set_context_optimization_trigger(value).await
             }
             "task_orchestration_mode" => self.handle_set_task_orchestration_mode(value).await,
-            "task_monitoring_enabled" => self.handle_set_task_monitoring_enabled(value).await,
+            "task_monitoring_enabled" => self.handle_set_task_monitoring_mode(value).await,
             "task_vector_check_enabled" => self.handle_set_task_vector_check_enabled(value).await,
             _ if parse_experimental_feature_config_id(&raw_config_id).is_some() => {
                 let spec = parse_experimental_feature_config_id(&raw_config_id)
@@ -3063,16 +3092,16 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    async fn handle_set_task_monitoring_enabled(
+    async fn handle_set_task_monitoring_mode(
         &mut self,
         value: SessionConfigValueId,
     ) -> Result<(), Error> {
-        let enabled = parse_on_off_toggle(value.0.as_ref(), "Task Monitoring")?;
-        self.task_monitoring.monitor_enabled = enabled;
+        let monitor_mode = TaskMonitoringMode::from_config_value(value.0.as_ref())?;
+        self.task_monitoring.monitor_mode = monitor_mode;
         self.client.log_canonical(
-            "acp.task_monitoring.enabled",
+            "acp.task_monitoring.mode",
             json!({
-                "enabled": enabled,
+                "mode": monitor_mode.as_config_value(),
             }),
         );
         Ok(())
@@ -3207,11 +3236,7 @@ impl<A: Auth> ThreadActor<A> {
         ));
         lines.push(format!(
             "- Task monitoring default: `{}`",
-            if self.task_monitoring.monitor_enabled {
-                "on"
-            } else {
-                "off"
-            }
+            self.task_monitoring.monitor_mode.as_config_value()
         ));
         lines.push(format!(
             "- Progress vector checks default: `{}`",
@@ -3308,7 +3333,7 @@ impl<A: Auth> ThreadActor<A> {
             status: orchestration_status,
         });
 
-        let task_monitoring_status = if self.task_monitoring.monitor_enabled {
+        let task_monitoring_status = if self.task_monitoring.monitor_mode.is_enabled() {
             StepStatus::Completed
         } else {
             StepStatus::Pending
@@ -3341,11 +3366,7 @@ impl<A: Auth> ThreadActor<A> {
         lines.push(format!(
             "Task monitoring: orchestration={}, monitor={}, vector_checks={}",
             self.task_monitoring.orchestration_mode.as_config_value(),
-            if self.task_monitoring.monitor_enabled {
-                "on"
-            } else {
-                "off"
-            },
+            self.task_monitoring.monitor_mode.as_config_value(),
             if self.task_monitoring.vector_check_enabled {
                 "on"
             } else {
@@ -3353,7 +3374,7 @@ impl<A: Auth> ThreadActor<A> {
             }
         ));
 
-        if !self.task_monitoring.monitor_enabled {
+        if !self.task_monitoring.monitor_mode.is_enabled() {
             lines.push("Task queue: monitoring disabled".to_string());
             return lines.join("\n");
         }
@@ -3754,7 +3775,7 @@ impl<A: Auth> ThreadActor<A> {
                             self.context_optimization.mode.as_config_value(),
                             self.context_optimization.trigger_percent,
                             self.task_monitoring.orchestration_mode.as_config_value(),
-                            if self.task_monitoring.monitor_enabled { "on" } else { "off" },
+                            self.task_monitoring.monitor_mode.as_config_value(),
                             if self.task_monitoring.vector_check_enabled { "on" } else { "off" },
                         ))
                         .await;
@@ -5538,6 +5559,51 @@ mod tests {
             "monitor command should not submit backend op"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_task_monitoring_auto_mode_updates_status() -> anyhow::Result<()> {
+        let (session_id, client, _thread, message_tx, local_set) = setup(vec![]).await?;
+        tokio::try_join!(
+            async {
+                let (set_config_tx, set_config_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::SetConfigOption {
+                    config_id: SessionConfigId::new("task_monitoring_enabled"),
+                    value: SessionConfigValueId::new("auto"),
+                    response_tx: set_config_tx,
+                })?;
+                set_config_rx.await??;
+
+                let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::Prompt {
+                    request: PromptRequest::new(session_id.clone(), vec!["/status".into()]),
+                    response_tx: prompt_response_tx,
+                })?;
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+
+                let notifications = client.notifications.lock().unwrap();
+                assert!(
+                    notifications.iter().any(|notification| {
+                        matches!(
+                            &notification.update,
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                ..
+                            }) if text.contains("- task_monitoring: auto")
+                        )
+                    }),
+                    "status should reflect task monitoring mode as auto after setting config. notifications={notifications:?}"
+                );
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
         Ok(())
     }
 
