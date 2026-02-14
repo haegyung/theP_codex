@@ -12,6 +12,8 @@
   - Implemented `render_monitor_retrospective` to render a fixed multi-item format matching the requested layout.
   - Added command hints in setup messaging for `/monitor retro` and in validation docs references.
   - Added unit coverage for `/monitor retro` output behavior.
+  - Changed task monitoring defaults so `task_monitoring` starts in `auto` mode.
+  - Implemented `auto` task monitoring behavior: `/monitor` shows task queue only when active tasks exist; when idle, queue output is omitted.
 
 ### Packaging / Versioning
 - `Cargo.toml`
@@ -30,7 +32,7 @@
 
 ## Tests
 - `cargo test`
-  - `31 passed` (verified during this release cycle).
+  - `34 passed` (verified during this release cycle).
 - `scripts/tag_release.sh`
   - Verified version/tag consistency and tag creation/push flow (`v0.9.10`).
 

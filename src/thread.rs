@@ -495,7 +495,7 @@ impl Default for TaskMonitoringState {
     fn default() -> Self {
         Self {
             orchestration_mode: TaskOrchestrationMode::Parallel,
-            monitor_mode: TaskMonitoringMode::On,
+            monitor_mode: TaskMonitoringMode::Auto,
             vector_check_enabled: true,
         }
     }
@@ -3379,7 +3379,7 @@ impl<A: Auth> ThreadActor<A> {
             return lines.join("\n");
         }
 
-        let mut active_tasks = self
+        let active_tasks = self
             .submissions
             .iter()
             .filter_map(|(submission_id, state)| {
@@ -3388,6 +3388,14 @@ impl<A: Auth> ThreadActor<A> {
                     .and_then(|label| state.is_active().then_some((submission_id.clone(), label)))
             })
             .collect::<Vec<_>>();
+
+        if matches!(self.task_monitoring.monitor_mode, TaskMonitoringMode::Auto)
+            && active_tasks.is_empty()
+        {
+            return lines.join("\n");
+        }
+
+        let mut active_tasks = active_tasks;
         active_tasks.sort_by(|a, b| a.0.cmp(&b.0));
 
         if active_tasks.is_empty() {
@@ -5548,8 +5556,9 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
         assert!(
-            text_chunks.iter().any(|text| text
-                .contains("Task monitoring: orchestration=parallel, monitor=on, vector_checks=on")),
+            text_chunks.iter().any(|text| text.contains(
+                "Task monitoring: orchestration=parallel, monitor=auto, vector_checks=on"
+            )),
             "monitor output should include task monitoring defaults. notifications={notifications:?}"
         );
 
@@ -5604,6 +5613,90 @@ mod tests {
                 anyhow::Ok(())
             }
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_auto_mode_hides_task_queue_without_active_tasks() -> anyhow::Result<()>
+    {
+        let session_id = SessionId::new("test-monitor-auto-idle");
+        let client = Arc::new(StubClient::new());
+        let thread = Arc::new(StubCodexThread::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client, Arc::default(), None);
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread,
+            models_manager,
+            config,
+            message_rx,
+        );
+        actor.task_monitoring.monitor_mode = TaskMonitoringMode::Auto;
+        actor.submissions = HashMap::new();
+
+        assert!(
+            !actor
+                .render_task_monitoring_snapshot()
+                .contains("Task queue:"),
+            "auto mode should suppress task queue output when no active tasks exist. snapshot={:?}",
+            actor.render_task_monitoring_snapshot()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_auto_mode_shows_task_queue_with_active_task() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test-monitor-auto-active");
+        let client = Arc::new(StubClient::new());
+        let thread = Arc::new(StubCodexThread::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client, Arc::default(), None);
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread,
+            models_manager,
+            config,
+            message_rx,
+        );
+        actor.task_monitoring.monitor_mode = TaskMonitoringMode::Auto;
+        actor.submissions = HashMap::new();
+        actor.submissions.insert(
+            "submission-1".to_string(),
+            SubmissionState::Task(TaskState::new_background(
+                actor.thread.clone(),
+                "submission-1".to_string(),
+            )),
+        );
+
+        let snapshot = actor.render_task_monitoring_snapshot();
+        assert!(
+            snapshot.contains("Task queue: 1 active"),
+            "auto mode should show queue when active tasks exist. snapshot={snapshot}"
+        );
+        assert!(
+            snapshot.contains("[in_progress] task: submission-1"),
+            "active task monitoring entry should include label and id. snapshot={snapshot}"
+        );
+
         Ok(())
     }
 
