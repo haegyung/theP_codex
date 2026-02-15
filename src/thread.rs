@@ -86,6 +86,11 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 const CONTEXT_OPT_TRIGGER_PERCENT_DEFAULT: i64 = 90;
 const CONTEXT_OPT_TRIGGER_PERCENT_OPTIONS: [i64; 5] = [75, 80, 85, 90, 95];
 const FEATURE_CONFIG_ID_PREFIX: &str = "beta_feature.";
+const MONITOR_PANEL_WIDTH_DEFAULT: usize = 92;
+const MONITOR_PANEL_WIDTH_MIN: usize = 56;
+const MONITOR_PANEL_WIDTH_MAX: usize = 132;
+const MONITOR_PROGRESS_BAR_MIN_WIDTH: usize = 18;
+const MONITOR_PROGRESS_BAR_MAX_WIDTH: usize = 40;
 
 #[derive(Clone, Debug)]
 struct SessionListEntry {
@@ -270,6 +275,44 @@ struct FlowVectorState {
 }
 
 impl FlowVectorState {
+    fn plan_status_counts(&self) -> (usize, usize, usize, usize) {
+        if self.last_plan.items.is_empty() {
+            return (0, 0, 0, 0);
+        }
+
+        let pending = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Pending))
+            .count();
+        let in_progress = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::InProgress))
+            .count();
+        let completed = self
+            .last_plan
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Completed))
+            .count();
+        (completed, in_progress, pending, self.last_plan.items.len())
+    }
+
+    fn render_progress_bar(completed: usize, total: usize, width: usize) -> String {
+        let safe_width = width.max(8);
+        let filled = if total == 0 {
+            0
+        } else {
+            completed.saturating_mul(safe_width) / total
+        }
+        .min(safe_width);
+        let empty = safe_width.saturating_sub(filled);
+        format!("[{}{}]", "#".repeat(filled), ".".repeat(empty))
+    }
+
     fn record_phase(&mut self, phase: char, detail: impl Into<String>) {
         match phase {
             'A' => self.analysis += 1,
@@ -343,33 +386,26 @@ impl FlowVectorState {
     }
 
     fn render_plan_progress(&self) -> String {
-        if self.last_plan.items.is_empty() {
-            return "Plan: no plan updates received yet.".to_string();
-        }
-
-        let pending = self
-            .last_plan
-            .items
-            .iter()
-            .filter(|item| matches!(item.status, StepStatus::Pending))
-            .count();
-        let in_progress = self
-            .last_plan
-            .items
-            .iter()
-            .filter(|item| matches!(item.status, StepStatus::InProgress))
-            .count();
-        let completed = self
-            .last_plan
-            .items
-            .iter()
-            .filter(|item| matches!(item.status, StepStatus::Completed))
-            .count();
+        let (completed, in_progress, pending, total) = self.plan_status_counts();
+        let percent = if total == 0 {
+            0
+        } else {
+            completed.saturating_mul(100) / total
+        };
+        let bar_width = monitor_progress_bar_width(monitor_panel_width());
+        let progress_bar = Self::render_progress_bar(completed, total, bar_width);
 
         let mut lines = Vec::new();
+        lines.push("Plan progress".to_string());
         lines.push(format!(
-            "Plan progress: completed={completed}, in_progress={in_progress}, pending={pending}"
+            "Progress: {progress_bar} {percent}% ({completed}/{total} completed, {in_progress} in_progress, {pending} pending)"
         ));
+
+        if self.last_plan.items.is_empty() {
+            lines.push("Plan: no plan updates received yet.".to_string());
+            return lines.join("\n");
+        }
+
         if let Some(explanation) = &self.last_plan.explanation
             && !explanation.trim().is_empty()
         {
@@ -3492,17 +3528,62 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn render_monitor_message(&self, detail: bool) -> String {
-        let mut lines = Vec::new();
-        lines.push("Thread monitor".to_string());
-        lines.push(self.flow_vector.render_plan_progress());
-        lines.push(String::new());
-        lines.push(self.render_task_monitoring_snapshot());
-        lines.push(String::new());
-        lines.push(format!(
-            "Context optimization: mode={}, trigger={}%, auto_compact_runs={}",
+        let panel_width = monitor_panel_width();
+        let active_task_count = self
+            .submissions
+            .values()
+            .filter(|state| state.monitor_label().is_some() && state.is_active())
+            .count();
+        let status_strip = format!(
+            "Status strip: orchestration={} | monitor={} | vector_checks={} | active_tasks={} | context={}@{}% | detail={}",
+            self.task_monitoring.orchestration_mode.as_config_value(),
+            self.task_monitoring.monitor_mode.as_config_value(),
+            if self.task_monitoring.vector_check_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            active_task_count,
             self.context_optimization.mode.as_config_value(),
             self.context_optimization.trigger_percent,
-            self.context_optimization.auto_compact_count
+            if detail { "on" } else { "off" }
+        );
+
+        let mut lines = Vec::new();
+        lines.push("Thread monitor".to_string());
+        lines.push(monitor_fit_line(&status_strip, panel_width));
+        lines.push(format!(
+            "Viewport width: {panel_width} cols (auto-fit enabled)"
+        ));
+        lines.push(String::new());
+        lines.push("Work thread (execution lane)".to_string());
+        lines.extend(monitor_fit_block(
+            &self.flow_vector.render_plan_progress(),
+            panel_width,
+        ));
+        lines.push(String::new());
+        lines.extend(monitor_fit_block(
+            &self.render_task_monitoring_snapshot(),
+            panel_width,
+        ));
+        lines.push(String::new());
+        lines.extend(monitor_fit_block(
+            &self.flow_vector.render_recent_actions(detail),
+            panel_width,
+        ));
+        lines.push(String::new());
+        lines.push("Monitor thread (meta lane, pinned)".to_string());
+        lines.push("Pinned panels: context telemetry | flow telemetry".to_string());
+        lines.push("Panel: Context telemetry".to_string());
+        lines.push(String::new());
+        lines.push(monitor_fit_line(
+            &format!(
+                "Context optimization: mode={}, trigger={}%, auto_compact_runs={}",
+                self.context_optimization.mode.as_config_value(),
+                self.context_optimization.trigger_percent,
+                self.context_optimization.auto_compact_count
+            ),
+            panel_width,
         ));
 
         if let Some(info) = &self.context_optimization.last_token_info {
@@ -3516,40 +3597,57 @@ impl<A: Auth> ThreadActor<A> {
                 } else {
                     0
                 };
-                lines.push(format!(
-                    "Latest context usage: {total}/{window} tokens (~{used}% used)"
+                lines.push(monitor_fit_line(
+                    &format!("Latest context usage: {total}/{window} tokens (~{used}% used)"),
+                    panel_width,
                 ));
             } else {
-                lines.push(format!(
-                    "Latest context usage: {total} tokens (window unknown)"
+                lines.push(monitor_fit_line(
+                    &format!("Latest context usage: {total} tokens (window unknown)"),
+                    panel_width,
                 ));
             }
         } else {
-            lines.push("Latest context usage: not available yet".to_string());
+            lines.push(monitor_fit_line(
+                "Latest context usage: not available yet",
+                panel_width,
+            ));
         }
 
         if let Some(estimate) = &self.context_optimization.last_prompt_estimate {
-            lines.push(format!(
-                "Latest prompt estimate: {} tokens (text={}, embedded={}, links={}, image_assumed={}, audio_assumed={})",
+            lines.push(monitor_fit_line(
+                &format!(
+                    "Latest prompt estimate: {} tokens (text={}, embedded={}, links={}, image_assumed={}, audio_assumed={})",
                 estimate.total_tokens,
                 estimate.text_tokens,
                 estimate.embedded_context_tokens,
                 estimate.resource_link_tokens,
                 estimate.image_tokens,
                 estimate.audio_tokens
+            ),
+                panel_width,
+            ));
+        } else {
+            lines.push(monitor_fit_line(
+                "Latest prompt estimate: not available yet",
+                panel_width,
             ));
         }
 
         lines.push(String::new());
+        lines.push("Panel: Flow telemetry".to_string());
         if self.task_monitoring.vector_check_enabled {
-            lines.push(self.flow_vector.render_compass());
-            lines.push(String::new());
-            lines.push(format!("Flow minimap: {}", self.flow_vector.path_string()));
-            lines.push(String::new());
-            lines.push(self.flow_vector.render_recent_actions(detail));
+            lines.extend(monitor_fit_block(
+                &self.flow_vector.render_compass(),
+                panel_width,
+            ));
         } else {
-            lines.push("Progress vector checks are disabled.".to_string());
+            lines.push("Flow compass: vector checks are disabled.".to_string());
         }
+        lines.push(monitor_fit_line(
+            &format!("Flow minimap: {}", self.flow_vector.path_string()),
+            panel_width,
+        ));
 
         lines.join("\n")
     }
@@ -4992,6 +5090,37 @@ fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
     }
 }
 
+fn monitor_panel_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .map(|columns| columns.saturating_sub(2))
+        .unwrap_or(MONITOR_PANEL_WIDTH_DEFAULT)
+        .clamp(MONITOR_PANEL_WIDTH_MIN, MONITOR_PANEL_WIDTH_MAX)
+}
+
+fn monitor_progress_bar_width(panel_width: usize) -> usize {
+    (panel_width / 3).clamp(
+        MONITOR_PROGRESS_BAR_MIN_WIDTH,
+        MONITOR_PROGRESS_BAR_MAX_WIDTH,
+    )
+}
+
+fn monitor_fit_line(text: &str, max_graphemes: usize) -> String {
+    if text.is_empty() {
+        String::new()
+    } else {
+        truncate_graphemes(text, max_graphemes.max(8))
+    }
+}
+
+fn monitor_fit_block(block: &str, max_graphemes: usize) -> Vec<String> {
+    block
+        .lines()
+        .map(|line| monitor_fit_line(line, max_graphemes))
+        .collect()
+}
+
 fn format_session_title(message: &str) -> Option<String> {
     let normalized = message.replace(['\r', '\n'], " ");
     let trimmed = normalized.trim();
@@ -5554,6 +5683,22 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("Thread monitor")),
             "notifications don't match {notifications:?}"
+        );
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Work thread (execution lane)")),
+            "monitor output should include work-thread section. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Monitor thread (meta lane, pinned)")),
+            "monitor output should include monitor-thread section. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks.iter().any(|text| text.contains("Progress: [")),
+            "monitor output should include default plan progress bar. notifications={notifications:?}"
         );
         assert!(
             text_chunks.iter().any(|text| text.contains(
