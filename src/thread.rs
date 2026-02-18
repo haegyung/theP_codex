@@ -545,13 +545,22 @@ struct SetupWizardProgressState {
 }
 
 impl SetupWizardProgressState {
-    fn verification_status(self) -> StepStatus {
-        let completed_count = usize::from(self.status_checked)
+    const TOTAL_VERIFICATION_STEPS: usize = 3;
+
+    fn completed_count(self) -> usize {
+        usize::from(self.status_checked)
             + usize::from(self.monitor_checked)
-            + usize::from(self.vector_checked);
-        match completed_count {
+            + usize::from(self.vector_checked)
+    }
+
+    fn progress_percent(self) -> usize {
+        (self.completed_count() * 100) / Self::TOTAL_VERIFICATION_STEPS
+    }
+
+    fn verification_status(self) -> StepStatus {
+        match self.completed_count() {
             0 => StepStatus::Pending,
-            3 => StepStatus::Completed,
+            Self::TOTAL_VERIFICATION_STEPS => StepStatus::Completed,
             _ => StepStatus::InProgress,
         }
     }
@@ -3281,6 +3290,12 @@ impl<A: Auth> ThreadActor<A> {
         lines.push("- `/new-window`: how to open a fresh thread in your client".to_string());
         lines.push(String::new());
         lines.push("Next actions".to_string());
+        lines.push(format!(
+            "- Verification progress: {}/{}, {}%",
+            self.setup_wizard_progress.completed_count(),
+            SetupWizardProgressState::TOTAL_VERIFICATION_STEPS,
+            self.setup_wizard_progress.progress_percent()
+        ));
         lines.push("- Run: `/status`".to_string());
         lines.push("- Run: `/monitor`".to_string());
         lines.push("- Run: `/vector`".to_string());
@@ -3382,8 +3397,14 @@ impl<A: Auth> ThreadActor<A> {
             status: vector_check_status,
         });
 
+        let verification_progress = self.setup_wizard_progress.completed_count();
         items.push(PlanItemArg {
-            step: "Verify: run /status, /monitor, and /vector".to_string(),
+            step: format!(
+                "Verify: run /status, /monitor, and /vector ({}/{}, {}%)",
+                verification_progress,
+                SetupWizardProgressState::TOTAL_VERIFICATION_STEPS,
+                self.setup_wizard_progress.progress_percent()
+            ),
             status: self.setup_wizard_progress.verification_status(),
         });
 
@@ -6100,13 +6121,18 @@ mod tests {
             "Defaults: parallel task orchestration",
             "Defaults: task monitoring mode enabled",
             "Defaults: progress vector checks enabled",
-            "Verify: run /status, /monitor, and /vector",
         ] {
             assert!(
                 steps.contains(&expected),
                 "expected plan to include step {expected:?}. steps={steps:?}"
             );
         }
+        assert!(
+            steps
+                .iter()
+                .any(|entry| entry.starts_with("Verify: run /status, /monitor, and /vector (")),
+            "expected plan to include verify progress step. steps={steps:?}"
+        );
 
         let ops = thread.ops.lock().unwrap();
         assert!(ops.is_empty(), "setup command should not submit backend op");
@@ -6164,7 +6190,7 @@ mod tests {
             .expect("expected /monitor output");
 
         assert!(
-            monitor_text.contains("Verify: run /status, /monitor, and /vector"),
+            monitor_text.contains("Verify: run /status, /monitor, and /vector ("),
             "monitor output should include current setup plan steps. notifications={notifications:?}"
         );
 
@@ -6232,9 +6258,11 @@ mod tests {
         let verify_step = plans
             .last()
             .and_then(|plan| {
-                plan.entries
-                    .iter()
-                    .find(|entry| entry.content == "Verify: run /status, /monitor, and /vector")
+                plan.entries.iter().find(|entry| {
+                    entry
+                        .content
+                        .starts_with("Verify: run /status, /monitor, and /vector (")
+                })
             })
             .expect("expected verify step in latest setup plan");
 

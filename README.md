@@ -183,6 +183,7 @@ npx @haegyung/xsfire-camp
 
 참고:
 
+- ACP 표준/기능 매핑: `docs/reference/acp_standard_spec.md`
 - `CODEX_HOME` 구조/권한: `docs/reference/codex_home_overview.md`
 - 이벤트 -> ACP 출력 매핑: `docs/reference/event_handling.md`
 - 로컬 검증 가이드: `docs/quality/verification_guidance.md`

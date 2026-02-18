@@ -8,7 +8,7 @@
 - `MS_FLUENT_TOKEN_SCHEMA.md`: 스키마 정의(필수 체크포인트 포함)
 - `fluent-tokens.json`: 샘플 토큰 데이터(경량 예시)
 - `fluent-theme.css`: CSS custom-property 기반 토큰 주입 + 기본 컴포넌트 래퍼 클래스
-- `fluent-wrappers.tsx`: React용 Button/Input/Card/Dialog 래퍼 예시
+- `fluent-wrappers.tsx`: React용 Button/Input/Card/Dialog 래퍼 예시 (theme toggle, helper text 연결, dialog focus trap 포함)
 - `fluent-research-notes.md`: 공식 문서 리서치 정리
 - `fluent-demo.html`: 토큰/테마 반영을 즉시 확인하는 정적 데모
 
@@ -52,9 +52,30 @@ export function Demo() {
       <div>
         <MsCard title="Theme / Dialog Demo">
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-            <MsButton onClick={() => setTheme('light')}>Light</MsButton>
-            <MsButton onClick={() => setTheme('dark')}>Dark</MsButton>
-            <MsButton onClick={() => setTheme('highContrast')}>High contrast</MsButton>
+            <MsButton
+              variant="secondary"
+              state={theme === 'light' ? 'selected' : undefined}
+              aria-pressed={theme === 'light'}
+              onClick={() => setTheme('light')}
+            >
+              Light
+            </MsButton>
+            <MsButton
+              variant="secondary"
+              state={theme === 'dark' ? 'selected' : undefined}
+              aria-pressed={theme === 'dark'}
+              onClick={() => setTheme('dark')}
+            >
+              Dark
+            </MsButton>
+            <MsButton
+              variant="secondary"
+              state={theme === 'highContrast' ? 'selected' : undefined}
+              aria-pressed={theme === 'highContrast'}
+              onClick={() => setTheme('highContrast')}
+            >
+              High contrast
+            </MsButton>
           </div>
 
           <MsInput
@@ -91,3 +112,5 @@ export function Demo() {
 - [ ] 키보드 포커스 링이 `--ms-focus-*` 토큰을 따름
 - [ ] 다크/라이트/고대비 전환 시 `data-ms-theme`만 바뀌어도 레이아웃이 깨지지 않음
 - [ ] 버튼/인풋 기본 인터랙션이 토큰 상태값(`hover/pressed/disabled`)으로만 제어됨
+- [ ] helper text와 입력이 `aria-describedby`로 연결됨
+- [ ] dialog가 Esc/Tab 순환/백드롭 클릭 닫기를 정상 처리함

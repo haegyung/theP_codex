@@ -23,6 +23,7 @@
 - [verification_guidance.md](quality/verification_guidance.md): 로컬/수동 검증 가이드
 
 ## reference/
+- [acp_standard_spec.md](reference/acp_standard_spec.md): ACP 표준 스펙과 xsfire-camp 기능 매핑
 - [codex_home_overview.md](reference/codex_home_overview.md): `CODEX_HOME` 구조/권한 설명
 - [event_handling.md](reference/event_handling.md): 이벤트 -> ACP 출력 매핑
 

@@ -1,183 +1,434 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Fluent Design Kit Demo</title>
-    <link rel="stylesheet" href="./fluent-theme.css" />
-    <style>
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-        min-height: 100%;
-      }
+<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Fluent Design Kit Demo</title>
+        <link rel="stylesheet" href="./fluent-theme.css" />
+        <style>
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+                min-height: 100%;
+            }
 
-      .container {
-        max-width: 920px;
-        margin: 0 auto;
-        padding: var(--ms-spacing-24);
-      }
+            body {
+                background: #f0f3f8;
+            }
 
-      .grid {
-        display: grid;
-        gap: var(--ms-spacing-16);
-      }
+            .demo-shell {
+                min-height: 100vh;
+                background:
+                    radial-gradient(
+                        circle at 16% 0%,
+                        var(--ms-color-brand-selected) 0%,
+                        transparent 46%
+                    ),
+                    radial-gradient(
+                        circle at 94% 10%,
+                        var(--ms-color-background-subtle) 0%,
+                        transparent 38%
+                    ),
+                    linear-gradient(
+                        180deg,
+                        var(--ms-color-background-subtle) 0%,
+                        var(--ms-color-background-default) 58%
+                    );
+            }
 
-      .row {
-        display: flex;
-        gap: var(--ms-spacing-12);
-        align-items: center;
-        flex-wrap: wrap;
-      }
+            .container {
+                max-width: 980px;
+                margin: 0 auto;
+                padding: clamp(16px, 3.2vw, 36px);
+                display: grid;
+                gap: var(--ms-spacing-16);
+            }
 
-      .tokenTable {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: var(--ms-spacing-12);
-      }
+            .hero {
+                position: relative;
+                overflow: hidden;
+                border-radius: 16px;
+                padding: clamp(18px, 3vw, 28px);
+                color: var(--ms-color-text-onBrand);
+                background: linear-gradient(
+                    135deg,
+                    var(--ms-color-brand-background) 0%,
+                    var(--ms-color-brand-hover) 48%,
+                    var(--ms-color-brand-focus) 100%
+                );
+                box-shadow: 0 20px 40px rgba(0, 76, 138, 0.26);
+            }
 
-      .chip {
-        border: 1px solid var(--ms-color-surface-border);
-        border-radius: var(--ms-radius-medium);
-        padding: var(--ms-spacing-12);
-        background: var(--ms-color-surface-card);
-      }
+            .hero::after {
+                content: "";
+                position: absolute;
+                inset: auto -110px -160px auto;
+                width: 300px;
+                height: 300px;
+                border-radius: 50%;
+                border: 1px solid rgba(255, 255, 255, 0.24);
+                background: radial-gradient(
+                    circle,
+                    rgba(255, 255, 255, 0.16),
+                    transparent 62%
+                );
+            }
 
-      .swatch {
-        width: 100%;
-        height: 28px;
-        border-radius: var(--ms-radius-small);
-        border: 1px solid var(--ms-color-surface-border);
-      }
+            .hero-title {
+                margin: 0;
+                font-size: clamp(26px, 4vw, 38px);
+                line-height: 1.08;
+            }
 
-      .muted {
-        color: var(--ms-color-foreground-muted);
-        font-size: var(--ms-font-size-caption);
-      }
+            .hero-copy {
+                margin: var(--ms-spacing-12) 0 0;
+                color: rgba(255, 255, 255, 0.9);
+                max-width: 65ch;
+            }
 
-      .tag {
-        display: inline-block;
-        padding: 4px 8px;
-        border-radius: 999px;
-        border: 1px solid var(--ms-color-surface-border);
-        background: var(--ms-color-background-subtle);
-        margin-right: 8px;
-        margin-bottom: 8px;
-        font-size: 12px;
-      }
+            .panel {
+                opacity: 0;
+                transform: translateY(8px);
+                animation: panel-in 360ms var(--ms-motion-enter) forwards;
+            }
 
-      pre {
-        background: var(--ms-color-background-subtle);
-        padding: var(--ms-spacing-12);
-        border-radius: var(--ms-radius-small);
-        border: 1px solid var(--ms-color-surface-border);
-        overflow: auto;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="ms-fluent-root" id="demo-root" data-ms-theme="light">
-      <main class="container">
-        <header class="grid">
-          <h1 style="margin: 0; font-size: var(--ms-font-size-title)">Fluent Design Kit Demo</h1>
-          <p class="muted" style="margin: 0">
-            이 페이지는 `docs/design-system/fluent-theme.css`와 토큰이 제대로 반영되는지 확인하는 샘플입니다.
-          </p>
-        </header>
+            .panel:nth-of-type(2) {
+                animation-delay: 70ms;
+            }
 
-        <section class="ms-fluent-card">
-          <h2 style="margin-top: 0">Theme Switch</h2>
-          <div class="row">
-            <button class="ms-fluent-button" data-theme="light">Light</button>
-            <button class="ms-fluent-button" data-theme="dark">Dark</button>
-            <button class="ms-fluent-button" data-theme="highContrast">High Contrast</button>
-          </div>
-        </section>
+            .panel:nth-of-type(3) {
+                animation-delay: 120ms;
+            }
 
-        <section class="ms-fluent-card">
-          <h2 style="margin-top: 0">컴포넌트</h2>
-          <div class="grid">
-            <label style="display: block">
-              <span style="display: inline-block; margin-bottom: 6px">Email</span>
-              <input class="ms-fluent-input" placeholder="you@example.com" />
-            </label>
-            <label style="display: block">
-              <span style="display: inline-block; margin-bottom: 6px">검색</span>
-              <input class="ms-fluent-input" placeholder="검색어 입력" disabled value="disabled state sample" />
-            </label>
-            <div class="row">
-              <button class="ms-fluent-button">Primary</button>
-              <button class="ms-fluent-button" style="background: var(--ms-color-surface-card); color: var(--ms-color-foreground-default)">
-                Secondary
-              </button>
-              <button class="ms-fluent-button" disabled>Disabled</button>
-            </div>
-          </div>
-        </section>
+            .panel:nth-of-type(4) {
+                animation-delay: 170ms;
+            }
 
-        <section class="ms-fluent-card">
-          <h2 style="margin-top: 0">토큰 스니펫</h2>
-          <div class="tokenTable">
-            <div class="chip">
-              <div>brand-background</div>
-              <div class="swatch" style="background: var(--ms-color-brand-background)"></div>
-            </div>
-            <div class="chip">
-              <div>surface-card</div>
-              <div class="swatch" style="background: var(--ms-color-surface-card)"></div>
-            </div>
-            <div class="chip">
-              <div>focus-color</div>
-              <div class="swatch" style="background: var(--ms-focus-color)"></div>
-            </div>
-            <div class="chip">
-              <div>brand-hover</div>
-              <div class="swatch" style="background: var(--ms-color-brand-hover)"></div>
-            </div>
-          </div>
-          <p class="muted" style="margin-top: var(--ms-spacing-12)">
-            하단 버튼으로 다크/HC 전환 시 토큰 값이 자동 적용되는지 확인하세요.
-          </p>
-        </section>
+            .panel:nth-of-type(5) {
+                animation-delay: 220ms;
+            }
 
-        <section class="ms-fluent-card">
-          <h2 style="margin-top: 0">액세스성 상태 라벨</h2>
-          <div class="row">
-            <span class="tag">Reduced Motion: <strong id="reducedMotion"></strong></span>
-            <span class="tag">Forced Colors: <strong id="forcedColors"></strong></span>
-            <span class="tag">Current Theme: <strong id="currentTheme">light</strong></span>
-          </div>
-        </section>
-      </main>
+            .panel-title {
+                margin: 0 0 var(--ms-spacing-12);
+                font-size: var(--ms-font-size-subtitle);
+            }
 
-      <script>
-        const root = document.getElementById('demo-root');
-        const currentTheme = document.getElementById('currentTheme');
-        const reducedMotion = document.getElementById('reducedMotion');
-        const forcedColors = document.getElementById('forcedColors');
+            .theme-controls {
+                display: flex;
+                gap: var(--ms-spacing-8);
+                flex-wrap: wrap;
+            }
 
-        function updateSystemState() {
-          reducedMotion.textContent = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-            ? 'on'
-            : 'off';
-          forcedColors.textContent = window.matchMedia('(forced-colors: active)').matches
-            ? 'on'
-            : 'off';
-        }
+            .surface-grid {
+                display: grid;
+                gap: var(--ms-spacing-12);
+            }
 
-        document.querySelectorAll('[data-theme]').forEach((button) => {
-          button.addEventListener('click', () => {
-            const theme = button.getAttribute('data-theme');
-            root.setAttribute('data-ms-theme', theme);
-            currentTheme.textContent = theme;
-          });
-        });
+            .button-row {
+                display: flex;
+                gap: var(--ms-spacing-8);
+                flex-wrap: wrap;
+            }
 
-        updateSystemState();
-        window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', updateSystemState);
-        window.matchMedia('(forced-colors: active)').addEventListener('change', updateSystemState);
-      </script>
-    </div>
-  </body>
+            .token-table {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+                gap: var(--ms-spacing-12);
+            }
+
+            .token-chip {
+                border: 1px solid var(--ms-color-surface-border);
+                border-radius: var(--ms-radius-medium);
+                padding: var(--ms-spacing-12);
+                background: var(--ms-color-surface-card);
+            }
+
+            .token-name {
+                margin-bottom: var(--ms-spacing-8);
+                font-weight: var(--ms-font-weight-semibold);
+                font-size: var(--ms-font-size-body);
+            }
+
+            .swatch {
+                width: 100%;
+                height: 28px;
+                border-radius: var(--ms-radius-small);
+                border: 1px solid var(--ms-color-surface-border);
+            }
+
+            .status-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: var(--ms-spacing-8);
+            }
+
+            .tag {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 10px;
+                border-radius: var(--ms-radius-full);
+                border: 1px solid var(--ms-color-surface-border);
+                background: var(--ms-color-background-subtle);
+                font-size: var(--ms-font-size-caption);
+            }
+
+            .muted {
+                margin: 0;
+                color: var(--ms-color-foreground-muted);
+                font-size: var(--ms-font-size-caption);
+            }
+
+            @keyframes panel-in {
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            @media (max-width: 720px) {
+                .container {
+                    gap: var(--ms-spacing-12);
+                }
+
+                .hero {
+                    padding: var(--ms-spacing-16);
+                    box-shadow: 0 14px 30px rgba(0, 76, 138, 0.21);
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div
+            class="ms-fluent-root demo-shell"
+            id="demo-root"
+            data-ms-theme="light"
+        >
+            <main class="container">
+                <header class="hero panel">
+                    <h1 class="hero-title">Fluent Design Kit Demo</h1>
+                    <p class="hero-copy">
+                        `fluent-theme.css`와 래퍼 컴포넌트 상태를 실제 화면에서
+                        빠르게 확인하기 위한 샘플입니다. 버튼/입력/토큰/접근성
+                        상태를 라이트, 다크, 고대비 테마로 즉시 점검할 수
+                        있습니다.
+                    </p>
+                </header>
+
+                <section class="ms-fluent-card panel">
+                    <h2 class="panel-title">Theme Switch</h2>
+                    <div
+                        class="theme-controls"
+                        role="group"
+                        aria-label="Theme mode switch"
+                    >
+                        <button
+                            class="ms-fluent-button ms-fluent-button-secondary theme-button"
+                            data-theme="light"
+                            aria-pressed="true"
+                        >
+                            Light
+                        </button>
+                        <button
+                            class="ms-fluent-button ms-fluent-button-secondary theme-button"
+                            data-theme="dark"
+                            aria-pressed="false"
+                        >
+                            Dark
+                        </button>
+                        <button
+                            class="ms-fluent-button ms-fluent-button-secondary theme-button"
+                            data-theme="highContrast"
+                            aria-pressed="false"
+                        >
+                            High Contrast
+                        </button>
+                    </div>
+                    <p class="muted" style="margin-top: var(--ms-spacing-12)">
+                        선택된 테마 버튼은 `aria-pressed`와 `selected` 스타일이
+                        동시에 반영됩니다.
+                    </p>
+                </section>
+
+                <section class="ms-fluent-card panel">
+                    <h2 class="panel-title">Component State</h2>
+                    <div class="surface-grid">
+                        <div class="ms-fluent-field">
+                            <label class="ms-fluent-label" for="demo-email"
+                                >Email</label
+                            >
+                            <input
+                                id="demo-email"
+                                class="ms-fluent-input"
+                                placeholder="you@example.com"
+                            />
+                            <small class="ms-fluent-helper"
+                                >helper text는 `aria-describedby`로 연결되는
+                                구조를 권장합니다.</small
+                            >
+                        </div>
+                        <div class="ms-fluent-field">
+                            <label class="ms-fluent-label" for="demo-search"
+                                >검색</label
+                            >
+                            <input
+                                id="demo-search"
+                                class="ms-fluent-input ms-fluent-input-invalid"
+                                aria-invalid="true"
+                                value="invalid sample"
+                            />
+                            <small
+                                class="ms-fluent-helper ms-fluent-helper-error"
+                                >입력값이 유효하지 않을 때는 error tone으로
+                                노출합니다.</small
+                            >
+                        </div>
+                        <div class="button-row">
+                            <button class="ms-fluent-button">Primary</button>
+                            <button
+                                class="ms-fluent-button ms-fluent-button-secondary"
+                            >
+                                Secondary
+                            </button>
+                            <button
+                                class="ms-fluent-button ms-fluent-button-secondary ms-fluent-button-selected"
+                                aria-pressed="true"
+                            >
+                                Selected
+                            </button>
+                            <button class="ms-fluent-button" disabled>
+                                Disabled
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="ms-fluent-card panel">
+                    <h2 class="panel-title">Token Swatches</h2>
+                    <div class="token-table">
+                        <div class="token-chip">
+                            <div class="token-name">brand-background</div>
+                            <div
+                                class="swatch"
+                                style="
+                                    background: var(
+                                        --ms-color-brand-background
+                                    );
+                                "
+                            ></div>
+                        </div>
+                        <div class="token-chip">
+                            <div class="token-name">brand-selected</div>
+                            <div
+                                class="swatch"
+                                style="
+                                    background: var(--ms-color-brand-selected);
+                                "
+                            ></div>
+                        </div>
+                        <div class="token-chip">
+                            <div class="token-name">surface-card</div>
+                            <div
+                                class="swatch"
+                                style="background: var(--ms-color-surface-card)"
+                            ></div>
+                        </div>
+                        <div class="token-chip">
+                            <div class="token-name">focus-color</div>
+                            <div
+                                class="swatch"
+                                style="background: var(--ms-focus-color)"
+                            ></div>
+                        </div>
+                    </div>
+                    <p class="muted" style="margin-top: var(--ms-spacing-12)">
+                        테마 전환 시 색상 토큰이 일관되게 바뀌는지, 버튼/입력
+                        대비가 유지되는지 확인하세요.
+                    </p>
+                </section>
+
+                <section class="ms-fluent-card panel">
+                    <h2 class="panel-title">Accessibility Signals</h2>
+                    <div class="status-row">
+                        <span class="tag"
+                            >Reduced Motion: <strong id="reducedMotion"></strong
+                        ></span>
+                        <span class="tag"
+                            >Forced Colors: <strong id="forcedColors"></strong
+                        ></span>
+                        <span class="tag"
+                            >Current Theme:
+                            <strong id="currentTheme">light</strong></span
+                        >
+                    </div>
+                </section>
+            </main>
+
+            <script>
+                const root = document.getElementById("demo-root");
+                const themeButtons = Array.from(
+                    document.querySelectorAll(".theme-button"),
+                );
+                const currentTheme = document.getElementById("currentTheme");
+                const reducedMotion = document.getElementById("reducedMotion");
+                const forcedColors = document.getElementById("forcedColors");
+                const motionQuery = window.matchMedia(
+                    "(prefers-reduced-motion: reduce)",
+                );
+                const forcedColorsQuery = window.matchMedia(
+                    "(forced-colors: active)",
+                );
+
+                function applyTheme(theme) {
+                    root.setAttribute("data-ms-theme", theme);
+                    currentTheme.textContent = theme;
+
+                    themeButtons.forEach((button) => {
+                        const selected =
+                            button.getAttribute("data-theme") === theme;
+                        button.setAttribute(
+                            "aria-pressed",
+                            selected ? "true" : "false",
+                        );
+                        button.classList.toggle(
+                            "ms-fluent-button-selected",
+                            selected,
+                        );
+                    });
+                }
+
+                function updateSystemState() {
+                    reducedMotion.textContent = motionQuery.matches
+                        ? "on"
+                        : "off";
+                    forcedColors.textContent = forcedColorsQuery.matches
+                        ? "on"
+                        : "off";
+                }
+
+                function bindQueryChange(mediaQueryList, handler) {
+                    if (typeof mediaQueryList.addEventListener === "function") {
+                        mediaQueryList.addEventListener("change", handler);
+                        return;
+                    }
+
+                    if (typeof mediaQueryList.addListener === "function") {
+                        mediaQueryList.addListener(handler);
+                    }
+                }
+
+                themeButtons.forEach((button) => {
+                    button.addEventListener("click", () => {
+                        applyTheme(button.getAttribute("data-theme"));
+                    });
+                });
+
+                applyTheme(root.getAttribute("data-ms-theme") || "light");
+                updateSystemState();
+                bindQueryChange(motionQuery, updateSystemState);
+                bindQueryChange(forcedColorsQuery, updateSystemState);
+            </script>
+        </div>
+    </body>
 </html>
