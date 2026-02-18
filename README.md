@@ -18,6 +18,15 @@ Language: [한국어](#총정리-kr) | [English](#overview-en)
 `xsfire-camp`는 **Codex CLI(codex-rs)** 를 **ACP(Agent Client Protocol)** 에이전트로 감싸, Zed/VS Code(ACP 확장) 같은 ACP 클라이언트에서 Codex를 “대화”가 아니라 **작업 실행이 포함된 세션**으로 운용하게 해줍니다.
 핵심 가치는 **CLI 세션과 ACP 세션이 동일한 `CODEX_HOME` 저장소/메타데이터를 공유**하도록 맞춰, 클라이언트가 달라도 작업 흐름이 끊기지 않는다는 점입니다.
 
+### theprometheus / Augmented Technology 관점
+
+- 이 프로젝트는 `theprometheus`의 **Augmented Technology** 관점에서, AI를 “대체 지능”이 아니라 **증강(보강) 지능**으로 다룹니다.
+- 목표는 자동화 자체보다, 사람이 더 잘 판단하고 더 안전하게 실행하고 더 정확히 복기할 수 있는 작업 환경을 만드는 것입니다.
+- 설계 우선순위는 다음과 같습니다.
+  - 세션 연속성: IDE/CLI를 넘나들어도 작업 맥락이 유지될 것
+  - 행동 가시성: Tool call/Plan/승인/모니터링 흐름이 구조적으로 남을 것
+  - 인간 통제권: 승인(Approvals)과 정책을 통해 위험 동작을 통제할 것
+
 ### 가지고 있는 기능
 
 - ACP 표준 I/O(stdio)로 동작하는 Codex 에이전트
@@ -195,6 +204,15 @@ npx @haegyung/xsfire-camp
 `xsfire-camp` wraps **Codex CLI (codex-rs)** as an **ACP (Agent Client Protocol)** agent so ACP clients (for example, Zed or ACP-enabled VS Code extensions) can run Codex as an execution-first working session, not just a chat window.
 
 It is designed so ACP sessions and CLI sessions can share the same `CODEX_HOME` source of truth, making handoff between IDE and terminal smoother.
+
+### theprometheus / Augmented Technology Framing
+
+- This project is aligned with `theprometheus` and treats AI as **augmented intelligence**, not replacement intelligence.
+- The primary objective is not automation alone, but improving human judgment quality, operational safety, and post-hoc traceability.
+- Design priorities:
+  - Session continuity across IDE and CLI
+  - Behavioral visibility through structured tool/plan/approval traces
+  - Human control via approval policies and explicit execution gates
 
 ### What It Provides
 
