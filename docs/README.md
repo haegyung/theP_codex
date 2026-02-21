@@ -23,6 +23,7 @@
 ## quality/
 - [qa_checklist.md](quality/qa_checklist.md): QA 체크리스트
 - [verification_guidance.md](quality/verification_guidance.md): 로컬/수동 검증 가이드
+- [serena_workflow.md](serena_workflow.md): Serena 기반 팀 작업 루프/품질 게이트 운영 가이드
 
 ## reference/
 - [acp_standard_spec.md](reference/acp_standard_spec.md): ACP 표준 스펙과 xsfire-camp 기능 매핑

@@ -31,3 +31,21 @@
 ## Security & Configuration Tips
 - Never commit API keys or other secrets; rely on environment variables such as `OPENAI_API_KEY` or `CODEX_API_KEY`.
 - Keep Zed settings synchronized via `scripts/zed_settings_backup.sh`/`restore` when adjusting local config (if used).
+
+## Purpose-Driven Execution Contract
+- When the user states a purpose, treat it as the fixed Goal with a verifiable completion condition.
+- Before implementation, run focused research and build an evidence-backed rubric.
+- Evidence-backed means every `Must` item cites at least one concrete source:
+  - file path in this repo, or
+  - command output from verification, or
+  - external primary source (with date) when needed.
+- Use this default loop:
+  - `Research -> Rubric -> Plan -> Implement -> Verify -> Score -> Next Action`
+- Do not ask handshake questions for normal progress:
+  - avoid `continue?`, `want me to proceed?`, `should I keep going?`
+- Continue automatically until all `Must` items pass or a hard blocker appears.
+- Hard blockers that justify a user question:
+  - destructive or irreversible actions,
+  - missing credentials/permissions,
+  - unresolved product choice with no supporting evidence.
+- If blocked, ask one concise question with a recommended default.
