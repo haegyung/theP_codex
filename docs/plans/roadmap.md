@@ -1,57 +1,108 @@
-# Roadmap
+# Roadmap (2026-02 Refresh)
 
-This document describes where this project is heading.
+This roadmap is execution-oriented: each milestone has explicit `Must` and `Should` checks,
+evidence paths, and verification commands.
 
-## North Star
+## Goal
+- Keep ACP work context continuous across clients and backend choices while preserving backend-native execution behavior (tool calls, approvals, file edits) instead of degrading to chat-only behavior.
 
-Keep **work context continuous** even if you switch:
+## Baseline (Already Shipped)
+- ACP stdio agent wrapper around Codex CLI.
+  - Evidence: `README.md`, `src/main.rs`, `src/acp_agent.rs`
+- Multi-backend routing with in-thread backend switching.
+  - Evidence: `src/multi_backend.rs`, `src/backend.rs`, `README.md` (`--backend=multi`, `/backend ...`)
+- Canonical session logging under `ACP_HOME` with redaction coverage.
+  - Evidence: `src/session_store.rs`, `docs/backend/session_store.md`, `src/session_store.rs` tests
+- Slash command parity and monitoring command coverage in tests.
+  - Evidence: `src/thread.rs` tests (`test_slash_command_smoke_flow`, `test_monitor_command`, etc.)
 
-- editors (Zed, VS Code, ...)
-- threads
-- LLM backends (Codex, Claude Code, Gemini CLI, ...)
+## Roadmap Principles
+- ACP surface stability first: avoid breaking client-visible protocol behavior.
+- Driver isolation: backend specifics should live behind driver boundaries.
+- Evidence-backed completion: each `Must` item closes only with concrete file/command evidence.
+- Safety over convenience: approvals/redaction/policy consistency is a release gate.
 
-…while preserving each backend's unique capabilities (tool calls, approvals, and file edits), not
-flattening them into “chat only”.
+## Milestone 1: Driver Boundary Hardening (Near Term)
+### Outcome
+- Internal backend driver boundary is explicit and testable without ACP API changes.
 
-## Now (Shipped)
+### Must
+1. Driver capability contract is clearly separated from ACP orchestration logic.
+2. Event translation path (`prompt -> tool/plan/approval`) is deterministic across drivers.
+3. Existing Codex behavior remains backward-compatible at slash-command level.
 
-- Codex CLI as an ACP agent (stdio) with session continuity via shared `CODEX_HOME`.
-- Compatibility with community VS Code ACP extensions that invoke agents as `<command> acp` or with
-  `--acp` (no-ops).
-- Global canonical session store under `ACP_HOME` (default `~/.acp`) that records a structured
-  timeline (prompt summary, tool calls, plan, approvals). See `docs/backend/session_store.md`.
+### Should
+1. `docs/backend/backend_development_guide.md` includes driver implementation checklist.
+2. Add one focused regression test for correlation continuity across event categories.
 
-## Next (Near Term)
+### Verification
+- `cargo test`
+- `cargo test thread::tests::test_slash_command_smoke_flow`
+- `cargo test session_store::tests::writes_canonical_log_and_redacts_secrets`
 
-- Backend driver interface
-  - Factor an internal “driver” trait so each backend can implement:
-    - prompt submission
-    - streamed events (tool calls, plan, terminal)
-    - approvals / permission gating
-    - session list/load/replay (if supported)
-  - Keep the ACP surface stable while swapping drivers.
-- VS Code support hardening
-  - Collect and document behavior differences across community “VSCode ACP” extensions (agent
-    invocation, env propagation, cwd behavior, streaming UI quirks).
-  - Provide a reference configuration and smoke checklist.
-- Canonical log schema tightening
-  - Versioned event types and minimal required fields.
-  - Better correlation IDs across: prompt -> tool calls -> approvals -> file changes.
+## Milestone 2: Non-Codex Backend Fidelity (Near-Mid Term)
+### Outcome
+- Claude Code and Gemini backends preserve meaningful streamed execution signals instead of reduced text-only responses.
 
-## Later (Medium Term)
+### Must
+1. Tool/approval/terminal progress from non-Codex backends maps into ACP event categories with minimal semantic loss.
+2. `/backend <name>` switching is stable in `--backend=multi` flow and does not corrupt session continuity.
+3. Auth routing remains method-id based and documented for each backend path.
 
-- Add real backends (CLI-first)
-  - Claude Code (stream-json output, externalized permission prompts)
-  - Gemini CLI (stream-json event model, approval modes)
-- “Translator” quality improvements
-  - Map backend-specific tool/approval models into ACP events without losing key information.
-  - Ensure canonical logs remain useful even when backends differ in granularity.
-- Security and compliance
-  - Expand redaction beyond basic token patterns.
-  - Policy knobs for excluding certain event types or payload fields from canonical logs.
+### Should
+1. Backend-specific feature matrix documented in `docs/backend/backends.md`.
+2. Add compatibility notes for known CLI limitations and fallbacks.
 
-## Non-Goals (For Now)
+### Verification
+- `cargo test`
+- `cargo test thread::tests::test_mcp`
+- `cargo test thread::tests::test_monitor_command`
+- Targeted manual smoke using `scripts/acp_compat_smoke.sh` (when client environment is available)
 
-- Forcing different vendors to share one native session store format.
-- Building a generic “chat only” bridge that drops tool calls/approvals.
+## Milestone 3: Session Continuity and Canonical Log Quality (Mid Term)
+### Outcome
+- Session replay/trace quality is reliable for cross-client and cross-backend workflows.
 
+### Must
+1. Canonical log schema versioning and required fields are explicitly defined and enforced.
+2. Correlation IDs remain intact across prompt/tool/approval/file-change timeline.
+3. Redaction policy covers known sensitive patterns with tests.
+
+### Should
+1. Add a lightweight log-inspection utility doc/workflow.
+2. Publish troubleshooting guide for missing/partial timeline events.
+
+### Verification
+- `cargo test`
+- `cargo test session_store::tests::writes_canonical_log_and_redacts_secrets`
+- `cargo test thread::tests::test_canonical_log_correlation_path`
+
+## Milestone 4: Client Readiness and Release Operations (Mid-Late Term)
+### Outcome
+- Installation, upgrade, and release flows are predictable for Zed/VS Code users and maintainers.
+
+### Must
+1. Quick-start paths for binary/npm usage are kept consistent between KR/EN README sections.
+2. Release process remains reproducible via scripts and documented checks.
+3. Platform package detection path stays green.
+
+### Should
+1. Add a concise VS Code ACP compatibility matrix.
+2. Add a "first 10 minutes" onboarding snippet for new contributors.
+
+### Verification
+- `cargo build --release`
+- `cargo test`
+- `node npm/testing/test-platform-detection.js`
+- `scripts/build_and_install.sh`
+
+## Quality Gate for Roadmap Work Items
+- A milestone item is closed only when all associated `Must` checks pass.
+- If a `Must` item fails, open a follow-up task immediately with:
+  - failure evidence (file path or command output),
+  - owner,
+  - next verification command.
+
+## Non-Goals (Current Horizon)
+- Forcing vendor-native session stores into one physical format.
+- Sacrificing backend-native execution semantics for simplified chat-only interoperability.

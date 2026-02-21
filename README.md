@@ -13,6 +13,20 @@ Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
 Language: [한국어](#총정리-kr) | [English](#overview-en)
 
+## Quick Start (60 sec)
+
+### KR
+1. 빌드: `cargo build --release`
+2. 실행: `OPENAI_API_KEY=... CODEX_HOME="$HOME/.codex" target/release/xsfire-camp`
+3. 멀티 백엔드: `target/release/xsfire-camp --backend=multi`
+4. 검증: `cargo test` / `node npm/testing/test-platform-detection.js`
+
+### EN
+1. Build: `cargo build --release`
+2. Run: `OPENAI_API_KEY=... CODEX_HOME="$HOME/.codex" target/release/xsfire-camp`
+3. Multi backend mode: `target/release/xsfire-camp --backend=multi`
+4. Verify: `cargo test` / `node npm/testing/test-platform-detection.js`
+
 ## 총정리 (KR)
 
 `xsfire-camp`는 **Codex CLI(codex-rs)** 를 **ACP(Agent Client Protocol)** 에이전트로 감싸, Zed/VS Code(ACP 확장) 같은 ACP 클라이언트에서 Codex를 “대화”가 아니라 **작업 실행이 포함된 세션**으로 운용하게 해줍니다.
@@ -36,10 +50,20 @@ Language: [한국어](#총정리-kr) | [English](#overview-en)
 - Tool calls(쉘 실행, apply_patch, 웹 검색, MCP tool call 등) 스트리밍 및 결과 업데이트
 - 승인(Approvals) 플로우: 실행/패치 등 위험 동작을 `RequestPermission`으로 노출하고 사용자 선택을 반영
 - Plan/TODO/Terminal 등 “작업 진행” 신호를 ACP `SessionUpdate`로 전달
-- Codex CLI parity 중심의 slash commands 지원: `/setup`, `/review`, `/compact`, `/undo`, `/init`, `/sessions`, `/load`, `/mcp`, `/skills` 등 (TIP: `/setup`은 Plan 패널에 체크리스트를 표시합니다)
-- 모니터링/UX 보조: `/monitor`(플랜/컨텍스트 사용량/트레이스), `/vector`(워크플로 방향 미니맵/나침반), `/new-window`(새 스레드 안내), `/experimental`(베타 기능 토글 안내)
+- Codex CLI parity 중심의 slash commands 지원: `/setup`, `/review`, `/review-branch`, `/review-commit`, `/compact`, `/undo`, `/init`, `/status`, `/sessions`, `/load`, `/mcp`, `/skills` 등 (TIP: `/setup`은 Plan 패널에 체크리스트를 표시합니다)
+- 모니터링/UX 보조: `/monitor`(플랜/컨텍스트 사용량/트레이스), `/monitor retro`(회고형 리포트), `/vector`(워크플로 방향 미니맵/나침반), `/new-window`(새 스레드 안내), `/experimental`(베타 기능 토글 안내)
 - Custom prompts: 저장된 prompt를 `/name KEY=value` 형태로 호출, `$1..$9`, `$ARGUMENTS` 및 named placeholder 지원
 - MCP 서버 병합: ACP 클라이언트가 제공한 MCP 서버(HTTP/stdio)를 codex-rs 설정에 병합
+
+### Slash Command Snapshot
+
+| Category | Commands |
+| --- | --- |
+| Core | `/setup`, `/review`, `/review-branch`, `/review-commit`, `/compact`, `/undo`, `/init`, `/status` |
+| Session | `/sessions`, `/load` |
+| Integrations | `/mcp`, `/skills` |
+| Monitoring | `/monitor`, `/monitor retro`, `/vector`, `/experimental` |
+| UX | `/new-window` |
 
 ### 효과 (왜 유용한가)
 
@@ -72,7 +96,7 @@ Language: [한국어](#총정리-kr) | [English](#overview-en)
 
 - 코드 변경 후 `/review`로 이슈 탐지 및 개선 루프 반복
 - `/review-branch <branch>` 또는 `/review-commit <sha>`로 비교 기반 리뷰
-- `/diff`로 변경사항 확인(환경에 따라 tool call로 스트리밍)
+- `/diff`로 변경사항 확인(백엔드/클라이언트 환경에 따라 지원 범위가 다를 수 있음)
 - 긴 대화/작업 후 `/compact`로 컨텍스트 압축, 필요시 `/undo`로 최근 턴 되돌리기
 - MCP 도구(사내 API, 문서 검색, 티켓 시스템 등)를 붙여 “리서치/실행/정리”를 한 세션에서 처리
 
@@ -96,6 +120,18 @@ Language: [한국어](#총정리-kr) | [English](#overview-en)
 - 인증: `OPENAI_API_KEY` 또는 `CODEX_API_KEY` 또는 ChatGPT subscription(환경에 따라)
 - 동일한 사용자 계정에서 `CODEX_HOME`을 공유하는 것을 권장
 - 글로벌 canonical 로그(기본 활성): `ACP_HOME` (기본 `~/.acp`) 및 정책은 `docs/backend/session_store.md`, `docs/backend/policies.md` 참고
+
+### 설정/인증 요약 (KR)
+
+| Type | Key / Method | Required | Notes |
+| --- | --- | --- | --- |
+| Env | `OPENAI_API_KEY` | Optional | Codex API 인증 방식 중 하나 |
+| Env | `CODEX_API_KEY` | Optional | Codex API 인증 방식 중 하나 |
+| Env | `CODEX_HOME` | Recommended | 세션/메타데이터 공유 경로 |
+| Env | `ACP_HOME` | Optional | canonical 로그 저장 경로 (기본 `~/.acp`) |
+| Method ID | `chatgpt` / `codex-api-key` / `openai-api-key` | Depends | Codex backend로 라우팅 |
+| Method ID | `claude-cli` / `gemini-cli` | Depends | 해당 CLI backend로 라우팅 |
+| Backend override | `XSFIRE_CLAUDE_BIN`, `XSFIRE_CLAUDE_ARGS`, `XSFIRE_GEMINI_BIN`, `XSFIRE_GEMINI_ARGS`, `XSFIRE_GEMINI_APPROVAL_MODE` | Optional | CLI 경로/인자/승인 모드 오버라이드 |
 
 ### 설치/실행 (바이너리)
 
@@ -228,7 +264,7 @@ It is designed so ACP sessions and CLI sessions can share the same `CODEX_HOME` 
 - Approval flow surfaced through ACP `RequestPermission`
 - Plan/TODO/terminal progression updates via ACP `SessionUpdate`
 - Slash-command parity focus:
-  `/setup`, `/review`, `/compact`, `/undo`, `/init`, `/sessions`, `/load`, `/mcp`, `/skills`, `/monitor`, `/vector`, `/experimental`
+  `/setup`, `/review`, `/review-branch`, `/review-commit`, `/compact`, `/undo`, `/init`, `/status`, `/sessions`, `/load`, `/mcp`, `/skills`, `/monitor`, `/monitor retro`, `/vector`, `/new-window`, `/experimental`
 - MCP server merge:
   client-provided MCP endpoints are merged into codex-rs configuration
 
@@ -272,6 +308,18 @@ Notes:
 - Those CLIs must be installed and authenticated separately.
 - In `--backend=multi`, switch inside a thread with `/backend codex`, `/backend claude-code`, or `/backend gemini`.
 - Authentication dispatch is method-id based: `chatgpt` / `codex-api-key` / `openai-api-key` route to Codex, while `claude-cli` / `gemini-cli` route to each CLI backend.
+
+### Configuration/Auth Snapshot (EN)
+
+| Type | Key / Method | Required | Notes |
+| --- | --- | --- | --- |
+| Env | `OPENAI_API_KEY` | Optional | One Codex auth path |
+| Env | `CODEX_API_KEY` | Optional | One Codex auth path |
+| Env | `CODEX_HOME` | Recommended | Shared session metadata path |
+| Env | `ACP_HOME` | Optional | Canonical log path (default `~/.acp`) |
+| Method ID | `chatgpt` / `codex-api-key` / `openai-api-key` | Depends | Routed to Codex backend |
+| Method ID | `claude-cli` / `gemini-cli` | Depends | Routed to corresponding CLI backend |
+| Backend override | `XSFIRE_CLAUDE_BIN`, `XSFIRE_CLAUDE_ARGS`, `XSFIRE_GEMINI_BIN`, `XSFIRE_GEMINI_ARGS`, `XSFIRE_GEMINI_APPROVAL_MODE` | Optional | Override backend binary/args/approval behavior |
 
 ### Quick Start (npm)
 
