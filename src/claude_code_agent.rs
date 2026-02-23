@@ -7,7 +7,13 @@ use agent_client_protocol::{
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
 };
 use std::sync::{Arc, Mutex};
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, process::Command, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Command,
+    rc::Rc,
+};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -386,7 +392,7 @@ impl BackendDriver for ClaudeCodeDriver {
 }
 
 impl ClaudeCodeDriver {
-    fn init_session_store(&self, session_id: &SessionId, cwd: &PathBuf) -> Option<SessionStore> {
+    fn init_session_store(&self, session_id: &SessionId, cwd: &Path) -> Option<SessionStore> {
         let idx = self.global_session_index.as_ref()?;
         let global_id = idx
             .lock()
@@ -397,7 +403,7 @@ impl ClaudeCodeDriver {
             "claude-code",
             session_id.0.to_string(),
             session_id.0.to_string(),
-            Some(cwd.as_path()),
+            Some(cwd),
         )
     }
 }

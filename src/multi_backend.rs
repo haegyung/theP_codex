@@ -65,9 +65,7 @@ impl MultiBackendDriver {
     fn parse_backend_selector(raw: &str) -> Option<BackendKind> {
         let trimmed = raw.trim();
         let mut parts = trimmed.split_whitespace();
-        let Some(cmd) = parts.next() else {
-            return None;
-        };
+        let cmd = parts.next()?;
         if cmd != "/backend" {
             return None;
         }
