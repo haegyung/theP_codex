@@ -229,6 +229,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      NPM_PUBLISH_OIDC_SCOPE: "@haegyung"
+      NPM_PUBLISH_OIDC_REPO: "theprometheusxyz/xsfire-camp"
 
     steps:
       - name: Check whether NPM publishing is configured
@@ -250,6 +253,16 @@ jobs:
           else
             echo "enabled=0" >> "$GITHUB_OUTPUT"
             echo "NPM publishing not configured (NPM_TOKEN empty and NPM_OIDC_PUBLISH is not enabled). Skipping."
+          fi
+
+      - name: Verify OIDC target metadata
+        if: steps.publish_config.outputs.enabled == '1'
+        run: |
+          echo "Configured OIDC scope: ${NPM_PUBLISH_OIDC_SCOPE}"
+          echo "Configured OIDC repository: ${NPM_PUBLISH_OIDC_REPO}"
+          echo "Current repository: ${GITHUB_REPOSITORY}"
+          if [ "${GITHUB_REPOSITORY}" != "${NPM_PUBLISH_OIDC_REPO}" ]; then
+            echo "::warning::This run is for ${GITHUB_REPOSITORY}, but trusted publishing is expected for ${NPM_PUBLISH_OIDC_REPO}."
           fi
 
       - name: Setup Node.js
@@ -293,7 +306,7 @@ jobs:
             USING_OIDC=0
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
             echo "registry=https://registry.npmjs.org/" > "${NPM_CONFIG_USERCONFIG}"
-            echo "Using GitHub OIDC trusted publishing (npm provenance)."
+            echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
           else
@@ -319,7 +332,7 @@ jobs:
                 PUBLISH_RESULT=$?
                 if [ "$USING_OIDC" -eq 1 ]; then
                   echo "Trusted publishing failed for $(basename "$pkg")."
-                  echo "1) Verify '@haegyung' scope is configured as a trusted publisher for this repository in npm."
+                  echo "1) Verify scope '${NPM_PUBLISH_OIDC_SCOPE}' is configured as a trusted publisher for repository '${NPM_PUBLISH_OIDC_REPO}' in npm."
                   echo "2) Confirm this workflow has 'id-token: write' permission and uses npm >= 9.5."
                   echo "3) Retry after enabling a valid repository secret NPM_TOKEN."
                   cat /tmp/npm-publish-platform.log
@@ -341,6 +354,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      NPM_PUBLISH_OIDC_SCOPE: "@haegyung"
+      NPM_PUBLISH_OIDC_REPO: "theprometheusxyz/xsfire-camp"
 
     steps:
       - name: Check whether NPM publishing is configured
@@ -362,6 +378,16 @@ jobs:
           else
             echo "enabled=0" >> "$GITHUB_OUTPUT"
             echo "NPM publishing not configured (NPM_TOKEN empty and NPM_OIDC_PUBLISH is not enabled). Skipping."
+          fi
+
+      - name: Verify OIDC target metadata
+        if: steps.publish_config.outputs.enabled == '1'
+        run: |
+          echo "Configured OIDC scope: ${NPM_PUBLISH_OIDC_SCOPE}"
+          echo "Configured OIDC repository: ${NPM_PUBLISH_OIDC_REPO}"
+          echo "Current repository: ${GITHUB_REPOSITORY}"
+          if [ "${GITHUB_REPOSITORY}" != "${NPM_PUBLISH_OIDC_REPO}" ]; then
+            echo "::warning::This run is for ${GITHUB_REPOSITORY}, but trusted publishing is expected for ${NPM_PUBLISH_OIDC_REPO}."
           fi
 
       - name: Setup Node.js
@@ -416,7 +442,7 @@ jobs:
             fi
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
             echo "registry=https://registry.npmjs.org/" > "${NPM_CONFIG_USERCONFIG}"
-            echo "Using GitHub OIDC trusted publishing (npm provenance)."
+            echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
           else
@@ -429,7 +455,7 @@ jobs:
             PUBLISH_RESULT=$?
             if [ "$USING_OIDC" -eq 1 ]; then
               echo "Trusted publishing failed for base package."
-              echo "1) Verify '@haegyung' scope is configured as a trusted publisher for this repository in npm."
+              echo "1) Verify scope '${NPM_PUBLISH_OIDC_SCOPE}' is configured as a trusted publisher for repository '${NPM_PUBLISH_OIDC_REPO}' in npm."
               echo "2) Confirm this workflow has 'id-token: write' permission and uses npm >= 9.5."
               echo "3) Retry after enabling a valid repository secret NPM_TOKEN."
               cat /tmp/npm-publish-base.log

@@ -20,7 +20,7 @@
 2. `NPM_TOKEN` repository secret 사용
 
 ### A-2. Trusted Publishing 경로
-1. npm 패키지/조직 설정에서 `haegyung/xsfire-camp` GitHub Actions를 trusted publisher로 등록
+1. npm 패키지/조직 설정에서 `@haegyung` scope의 GitHub Actions를 trusted publisher로 등록하고 repository를 `theprometheusxyz/xsfire-camp`로 맞춤
 2. workflow의 `id-token: write` 권한은 이미 있음 (`.github/workflows/release.yml`)
 3. 설정 후 `release.yml` 재실행
 4. 성공 확인:
@@ -47,7 +47,7 @@ gh pr view 4811 --repo zed-industries/extensions --json state,mergedAt,url
 
 ## Verification Commands
 ```bash
-gh run list --repo haegyung/xsfire-camp --workflow release.yml --limit 3
+gh run list --repo theprometheusxyz/xsfire-camp --workflow release.yml --limit 3
 npm view @haegyung/xsfire-camp version
 gh pr view 4811 --repo zed-industries/extensions --json state,mergeStateStatus,url
 ```
