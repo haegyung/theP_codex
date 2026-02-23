@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  NPM_PUBLISH_OIDC_SCOPE: ${{ vars.NPM_PUBLISH_OIDC_SCOPE || '@haegyung' }}
+  NPM_PUBLISH_OIDC_REPO: ${{ vars.NPM_PUBLISH_OIDC_REPO || 'theprometheusxyz/xsfire-camp' }}
 
 jobs:
   get-version:
@@ -229,10 +231,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      NPM_PUBLISH_OIDC_SCOPE: "@haegyung"
-      NPM_PUBLISH_OIDC_REPO: "theprometheusxyz/xsfire-camp"
-
     steps:
       - name: Check whether NPM publishing is configured
         id: publish_config
@@ -354,10 +352,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      NPM_PUBLISH_OIDC_SCOPE: "@haegyung"
-      NPM_PUBLISH_OIDC_REPO: "theprometheusxyz/xsfire-camp"
-
     steps:
       - name: Check whether NPM publishing is configured
         id: publish_config
