@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use codex_apply_patch::parse_patch;
@@ -93,6 +94,22 @@ const MONITOR_PROGRESS_BAR_MIN_WIDTH: usize = 18;
 const MONITOR_PROGRESS_BAR_MAX_WIDTH: usize = 40;
 const CONFIG_OPTIONS_DENSITY_ENV: &str = "XSFIRE_CONFIG_OPTIONS_DENSITY";
 const CONFIG_OPTIONS_INLINE_FULL_MIN_COLUMNS: usize = 140;
+const EXEC_OUTPUT_MAX_BYTES_ENV: &str = "ACP_EXEC_OUTPUT_MAX_BYTES";
+const EXEC_OUTPUT_MAX_BYTES_DEFAULT: usize = 64 * 1024;
+const EXEC_OUTPUT_MAX_BYTES_MIN: usize = 4 * 1024;
+const EXEC_OUTPUT_MAX_BYTES_MAX: usize = 2 * 1024 * 1024;
+const UI_TEXT_CHUNK_MAX_CHARS_ENV: &str = "ACP_UI_TEXT_CHUNK_MAX_CHARS";
+const UI_TEXT_CHUNK_MAX_CHARS_DEFAULT: usize = 12_000;
+const UI_TEXT_CHUNK_MAX_CHARS_MIN: usize = 512;
+const UI_TEXT_CHUNK_MAX_CHARS_MAX: usize = 200_000;
+const TOOL_RAW_OUTPUT_MAX_CHARS_ENV: &str = "ACP_TOOL_RAW_OUTPUT_MAX_CHARS";
+const TOOL_RAW_OUTPUT_MAX_CHARS_DEFAULT: usize = 32_000;
+const TOOL_RAW_OUTPUT_MAX_CHARS_MIN: usize = 2_048;
+const TOOL_RAW_OUTPUT_MAX_CHARS_MAX: usize = 500_000;
+const TOOL_CALL_WATCHDOG_SECONDS_DEFAULT: u64 = 90;
+const TOOL_CALL_WATCHDOG_SECONDS_MIN: u64 = 60;
+const TOOL_CALL_WATCHDOG_SECONDS_MAX: u64 = 120;
+const TOOL_CALL_WATCHDOG_TICK_SECONDS: u64 = 1;
 
 #[derive(Clone, Debug)]
 struct SessionListEntry {
@@ -184,6 +201,31 @@ impl TaskMonitoringMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiVisibilityMode {
+    Full,
+    FinalOnly,
+}
+
+impl UiVisibilityMode {
+    fn from_env() -> Self {
+        match std::env::var("ACP_UI_VISIBILITY_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("final_only") => Self::FinalOnly,
+            _ => Self::Full,
+        }
+    }
+
+    fn hides_internal_updates(self) -> bool {
+        matches!(self, Self::FinalOnly)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorMode {
     Standard,
     Detail,
@@ -264,6 +306,185 @@ fn parse_on_off_toggle(raw: &str, option_name: &str) -> Result<bool, Error> {
                 .data(format!("{option_name} values must be one of: on, off")))
         }
     }
+}
+
+fn parse_on_off_env(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_bounded_usize_env(var_name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn ui_text_chunk_max_chars_from_env() -> usize {
+    parse_bounded_usize_env(
+        UI_TEXT_CHUNK_MAX_CHARS_ENV,
+        UI_TEXT_CHUNK_MAX_CHARS_DEFAULT,
+        UI_TEXT_CHUNK_MAX_CHARS_MIN,
+        UI_TEXT_CHUNK_MAX_CHARS_MAX,
+    )
+}
+
+fn truncate_to_char_limit(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect::<String>()
+}
+
+fn truncate_to_byte_limit(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn cap_json_payload_for_ui(payload: serde_json::Value, payload_name: &str) -> serde_json::Value {
+    let max_chars = parse_bounded_usize_env(
+        TOOL_RAW_OUTPUT_MAX_CHARS_ENV,
+        TOOL_RAW_OUTPUT_MAX_CHARS_DEFAULT,
+        TOOL_RAW_OUTPUT_MAX_CHARS_MIN,
+        TOOL_RAW_OUTPUT_MAX_CHARS_MAX,
+    );
+
+    let rendered = serde_json::to_string(&payload).unwrap_or_else(|_| "<unserializable>".into());
+    if rendered.chars().count() <= max_chars {
+        return payload;
+    }
+
+    json!({
+        "truncated": true,
+        "payload": payload_name,
+        "original_chars": rendered.chars().count(),
+        "limit_chars": max_chars,
+        "preview": truncate_to_char_limit(&rendered, max_chars),
+        "hint": format!("Set {TOOL_RAW_OUTPUT_MAX_CHARS_ENV} to raise/lower this limit"),
+    })
+}
+
+fn cap_tool_call_payloads_for_ui(mut tool_call: ToolCall) -> ToolCall {
+    if let Some(raw_input) = tool_call.raw_input.take() {
+        tool_call.raw_input = Some(cap_json_payload_for_ui(raw_input, "tool_call.raw_input"));
+    }
+    if let Some(raw_output) = tool_call.raw_output.take() {
+        tool_call.raw_output = Some(cap_json_payload_for_ui(raw_output, "tool_call.raw_output"));
+    }
+    tool_call
+}
+
+fn cap_tool_call_update_payloads_for_ui(mut update: ToolCallUpdate) -> ToolCallUpdate {
+    if let Some(raw_input) = update.fields.raw_input.take() {
+        update.fields.raw_input = Some(cap_json_payload_for_ui(
+            raw_input,
+            "tool_call_update.raw_input",
+        ));
+    }
+    if let Some(raw_output) = update.fields.raw_output.take() {
+        update.fields.raw_output = Some(cap_json_payload_for_ui(
+            raw_output,
+            "tool_call_update.raw_output",
+        ));
+    }
+    update
+}
+
+fn split_text_for_ui_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for ch in text.chars() {
+        current.push(ch);
+        current_chars += 1;
+        if current_chars >= max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn decode_utf8_streaming(pending_bytes: &mut Vec<u8>, chunk: &[u8], flush: bool) -> String {
+    pending_bytes.extend_from_slice(chunk);
+    if pending_bytes.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    while cursor < pending_bytes.len() {
+        match std::str::from_utf8(&pending_bytes[cursor..]) {
+            Ok(valid) => {
+                output.push_str(valid);
+                cursor = pending_bytes.len();
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    let end = cursor + valid_up_to;
+                    if let Ok(valid_prefix) = std::str::from_utf8(&pending_bytes[cursor..end]) {
+                        output.push_str(valid_prefix);
+                    }
+                    cursor = end;
+                }
+
+                match err.error_len() {
+                    Some(error_len) => {
+                        output.push('\u{FFFD}');
+                        cursor = cursor.saturating_add(error_len);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if flush {
+        if cursor < pending_bytes.len() {
+            output.push_str(&String::from_utf8_lossy(&pending_bytes[cursor..]));
+        }
+        pending_bytes.clear();
+    } else if cursor == pending_bytes.len() {
+        pending_bytes.clear();
+    } else {
+        let trailing = pending_bytes[cursor..].to_vec();
+        *pending_bytes = trailing;
+    }
+
+    output
+}
+
+fn sanitize_internal_frame_text(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("assistant to=")
+                || trimmed.starts_with("assistant  to=")
+                || trimmed.starts_with("assistant to =")
+                || trimmed.starts_with("tool_call("))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -575,14 +796,21 @@ struct TaskMonitoringState {
     orchestration_mode: TaskOrchestrationMode,
     monitor_mode: TaskMonitoringMode,
     vector_check_enabled: bool,
+    preempt_on_new_prompt: bool,
 }
 
 impl Default for TaskMonitoringState {
     fn default() -> Self {
+        let preempt_on_new_prompt = std::env::var("ACP_PREEMPT_ON_NEW_PROMPT")
+            .ok()
+            .as_deref()
+            .and_then(parse_on_off_env)
+            .unwrap_or(true);
         Self {
             orchestration_mode: TaskOrchestrationMode::Parallel,
             monitor_mode: TaskMonitoringMode::Auto,
             vector_check_enabled: true,
+            preempt_on_new_prompt,
         }
     }
 }
@@ -905,6 +1133,41 @@ impl SubmissionState {
         }
     }
 
+    async fn handle_watchdog_tick(&mut self, client: &SessionClient) {
+        match self {
+            Self::Prompt(state) => state.handle_watchdog_tick(client).await,
+            Self::Task(state) => state.handle_watchdog_tick(client).await,
+            Self::CustomPrompts(_) | Self::OneShot(_) => {}
+        }
+    }
+
+    async fn fail_open_tool_calls(&mut self, client: &SessionClient, reason: &str) {
+        match self {
+            Self::Prompt(state) => state.fail_open_tool_calls(client, reason).await,
+            Self::Task(state) => state.fail_open_tool_calls(client, reason).await,
+            Self::CustomPrompts(_) | Self::OneShot(_) => {}
+        }
+    }
+
+    async fn force_cancelled(&mut self, client: &SessionClient, reason: &str) {
+        match self {
+            Self::Prompt(state) => state.force_cancelled(client, reason).await,
+            Self::Task(state) => state.force_cancelled(client, reason).await,
+            Self::OneShot(state) => {
+                if let Some(tx) = state.response_tx.take() {
+                    drop(tx.send(Ok(StopReason::Cancelled)));
+                }
+            }
+            Self::CustomPrompts(state) => {
+                if let Some(tx) = state.response_tx.take() {
+                    drop(tx.send(Err(
+                        Error::internal_error().data("custom prompt listing cancelled"),
+                    )));
+                }
+            }
+        }
+    }
+
     fn monitor_label(&self) -> Option<&'static str> {
         match self {
             Self::CustomPrompts(_) => None,
@@ -1038,22 +1301,104 @@ struct ActiveCommand {
     tool_call_id: ToolCallId,
     terminal_output: bool,
     output: String,
+    visible_output_bytes: usize,
+    output_limit_bytes: usize,
+    output_truncated: bool,
+    truncation_notice_sent: bool,
+    pending_utf8_bytes: Vec<u8>,
     file_extension: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenToolCall {
+    kind: &'static str,
+    started_at: Instant,
 }
 
 struct PromptState {
     active_command: Option<ActiveCommand>,
     active_web_search: Option<String>,
+    open_tool_calls: HashMap<String, OpenToolCall>,
     thread: Arc<dyn CodexThreadImpl>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    buffered_agent_text: String,
     completed: bool,
+    run_started_logged: bool,
+    awaiting_model_resume: bool,
+    tool_watchdog_timeout: Duration,
 }
 
 impl PromptState {
+    fn tool_watchdog_timeout_from_env() -> Duration {
+        let parsed = std::env::var("ACP_TOOL_WATCHDOG_SECONDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(TOOL_CALL_WATCHDOG_SECONDS_DEFAULT);
+        let bounded = parsed.clamp(
+            TOOL_CALL_WATCHDOG_SECONDS_MIN,
+            TOOL_CALL_WATCHDOG_SECONDS_MAX,
+        );
+        Duration::from_secs(bounded)
+    }
+
+    fn exec_output_limit_bytes_from_env() -> usize {
+        parse_bounded_usize_env(
+            EXEC_OUTPUT_MAX_BYTES_ENV,
+            EXEC_OUTPUT_MAX_BYTES_DEFAULT,
+            EXEC_OUTPUT_MAX_BYTES_MIN,
+            EXEC_OUTPUT_MAX_BYTES_MAX,
+        )
+    }
+
+    fn clamp_exec_output_for_ui(
+        active_command: &mut ActiveCommand,
+        data: String,
+    ) -> Option<String> {
+        if data.is_empty() {
+            return None;
+        }
+
+        let mut bounded = String::new();
+        if !active_command.output_truncated {
+            let remaining = active_command
+                .output_limit_bytes
+                .saturating_sub(active_command.visible_output_bytes);
+            if remaining == 0 {
+                active_command.output_truncated = true;
+            } else if data.len() <= remaining {
+                active_command.visible_output_bytes += data.len();
+                bounded.push_str(&data);
+            } else {
+                let allowed = truncate_to_byte_limit(&data, remaining);
+                active_command.visible_output_bytes += allowed.len();
+                bounded.push_str(&allowed);
+                active_command.output_truncated = true;
+            }
+        }
+
+        if active_command.output_truncated && !active_command.truncation_notice_sent {
+            if !bounded.is_empty() && !bounded.ends_with('\n') {
+                bounded.push('\n');
+            }
+            bounded.push_str(&format!(
+                "[xsfire-camp] Output truncated after {} bytes to keep the session stable. Set {} to adjust this limit.\n",
+                active_command.output_limit_bytes,
+                EXEC_OUTPUT_MAX_BYTES_ENV
+            ));
+            active_command.truncation_notice_sent = true;
+        }
+
+        if bounded.is_empty() {
+            None
+        } else {
+            Some(bounded)
+        }
+    }
+
     fn new(
         thread: Arc<dyn CodexThreadImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
@@ -1062,13 +1407,18 @@ impl PromptState {
         Self {
             active_command: None,
             active_web_search: None,
+            open_tool_calls: HashMap::new(),
             thread,
             event_count: 0,
             response_tx: Some(response_tx),
             submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            buffered_agent_text: String::new(),
             completed: false,
+            run_started_logged: false,
+            awaiting_model_resume: false,
+            tool_watchdog_timeout: Self::tool_watchdog_timeout_from_env(),
         }
     }
 
@@ -1076,13 +1426,18 @@ impl PromptState {
         Self {
             active_command: None,
             active_web_search: None,
+            open_tool_calls: HashMap::new(),
             thread,
             event_count: 0,
             response_tx: None,
             submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            buffered_agent_text: String::new(),
             completed: false,
+            run_started_logged: false,
+            awaiting_model_resume: false,
+            tool_watchdog_timeout: Self::tool_watchdog_timeout_from_env(),
         }
     }
 
@@ -1100,15 +1455,280 @@ impl PromptState {
         self.completed = true;
     }
 
+    async fn emit_agent_text_for_ui(&mut self, client: &SessionClient, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        if client.ui_visibility_mode().hides_internal_updates() {
+            let sanitized = sanitize_internal_frame_text(&text);
+            if !sanitized.is_empty() {
+                if !self.buffered_agent_text.is_empty() {
+                    self.buffered_agent_text.push('\n');
+                }
+                self.buffered_agent_text.push_str(&sanitized);
+            }
+            return;
+        }
+
+        client.send_agent_text(text).await;
+    }
+
+    async fn flush_final_agent_text_if_needed(&mut self, client: &SessionClient) {
+        if !client.ui_visibility_mode().hides_internal_updates() {
+            return;
+        }
+        if self.buffered_agent_text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.buffered_agent_text);
+        client.send_agent_text(text).await;
+    }
+
+    fn ensure_run_started_logged(&mut self, client: &SessionClient) {
+        if self.run_started_logged {
+            return;
+        }
+        self.run_started_logged = true;
+        client.log_canonical(
+            "acp.bridge.run_started",
+            json!({
+                "submission_id": self.submission_id,
+            }),
+        );
+    }
+
+    fn mark_tool_call_started(
+        &mut self,
+        client: &SessionClient,
+        call_id: &str,
+        kind: &'static str,
+    ) {
+        self.open_tool_calls.insert(
+            call_id.to_string(),
+            OpenToolCall {
+                kind,
+                started_at: Instant::now(),
+            },
+        );
+        client.log_canonical(
+            "acp.bridge.tool_call_received",
+            json!({
+                "submission_id": self.submission_id,
+                "tool_call_id": call_id,
+                "tool_kind": kind,
+            }),
+        );
+        client.log_canonical(
+            "acp.bridge.tool_exec_started",
+            json!({
+                "submission_id": self.submission_id,
+                "tool_call_id": call_id,
+                "tool_kind": kind,
+            }),
+        );
+    }
+
+    fn mark_tool_exec_finished(
+        &self,
+        client: &SessionClient,
+        call_id: &str,
+        kind: &str,
+        status: ToolCallStatus,
+        exit_code: Option<i32>,
+        reason: Option<&str>,
+    ) {
+        client.log_canonical(
+            "acp.bridge.tool_exec_finished",
+            json!({
+                "submission_id": self.submission_id,
+                "tool_call_id": call_id,
+                "tool_kind": kind,
+                "status": format!("{status:?}"),
+                "exit_code": exit_code,
+                "reason": reason,
+            }),
+        );
+    }
+
+    fn mark_tool_result_sent(
+        &mut self,
+        client: &SessionClient,
+        call_id: &str,
+        status: ToolCallStatus,
+        reason: Option<&str>,
+    ) {
+        self.awaiting_model_resume = true;
+        client.log_canonical(
+            "acp.bridge.tool_result_sent",
+            json!({
+                "submission_id": self.submission_id,
+                "tool_call_id": call_id,
+                "status": format!("{status:?}"),
+                "reason": reason,
+            }),
+        );
+    }
+
+    fn maybe_log_model_resumed(&mut self, client: &SessionClient) {
+        if !self.awaiting_model_resume {
+            return;
+        }
+        self.awaiting_model_resume = false;
+        client.log_canonical(
+            "acp.bridge.model_resumed",
+            json!({
+                "submission_id": self.submission_id,
+            }),
+        );
+    }
+
+    fn mark_final_emitted(&self, client: &SessionClient, stop_reason: &str) {
+        client.log_canonical(
+            "acp.bridge.final_emitted",
+            json!({
+                "submission_id": self.submission_id,
+                "stop_reason": stop_reason,
+            }),
+        );
+    }
+
+    async fn fail_tool_call_with_reason(
+        &mut self,
+        client: &SessionClient,
+        call_id: &str,
+        reason: &str,
+    ) {
+        let call_id_owned = call_id.to_string();
+        let Some(open_call) = self.open_tool_calls.remove(call_id) else {
+            return;
+        };
+
+        self.mark_tool_exec_finished(
+            client,
+            call_id,
+            open_call.kind,
+            ToolCallStatus::Failed,
+            None,
+            Some(reason),
+        );
+        client
+            .send_tool_call_update(ToolCallUpdate::new(
+                call_id_owned.clone(),
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Failed)
+                    .raw_output(json!({
+                        "error": reason,
+                        "tool_kind": open_call.kind,
+                    })),
+            ))
+            .await;
+        self.mark_tool_result_sent(client, &call_id_owned, ToolCallStatus::Failed, Some(reason));
+
+        if self
+            .active_command
+            .as_ref()
+            .is_some_and(|active| active.call_id == call_id)
+        {
+            self.active_command = None;
+        }
+        if self.active_web_search.as_deref() == Some(call_id) {
+            self.active_web_search = None;
+        }
+    }
+
+    async fn fail_open_tool_calls(&mut self, client: &SessionClient, reason: &str) {
+        let call_ids = self.open_tool_calls.keys().cloned().collect::<Vec<_>>();
+        for call_id in call_ids {
+            self.fail_tool_call_with_reason(client, &call_id, reason)
+                .await;
+        }
+    }
+
+    async fn force_cancelled(&mut self, client: &SessionClient, reason: &str) {
+        self.fail_open_tool_calls(client, reason).await;
+        if !self.completed {
+            self.mark_final_emitted(client, "cancelled_preempted");
+            self.finish_with_result(Ok(StopReason::Cancelled));
+        }
+    }
+
+    async fn handle_watchdog_tick(&mut self, client: &SessionClient) {
+        if self.completed {
+            return;
+        }
+        let now = Instant::now();
+        let timed_out = self
+            .open_tool_calls
+            .iter()
+            .filter_map(|(call_id, open_call)| {
+                if now.duration_since(open_call.started_at) >= self.tool_watchdog_timeout {
+                    Some(call_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for call_id in timed_out {
+            self.fail_tool_call_with_reason(client, &call_id, "watchdog_timeout")
+                .await;
+        }
+    }
+
+    async fn emit_exec_output_update(
+        client: &SessionClient,
+        active_command: &mut ActiveCommand,
+        call_id: &str,
+        data: String,
+    ) {
+        let Some(data) = Self::clamp_exec_output_for_ui(active_command, data) else {
+            return;
+        };
+
+        let update = if client.supports_terminal_output(active_command) {
+            ToolCallUpdate::new(
+                active_command.tool_call_id.clone(),
+                ToolCallUpdateFields::new(),
+            )
+            .meta(Meta::from_iter([(
+                "terminal_output".to_owned(),
+                serde_json::json!({
+                    "terminal_id": call_id,
+                    "data": data
+                }),
+            )]))
+        } else {
+            active_command.output.push_str(&data);
+            let content = match active_command.file_extension.as_deref() {
+                Some("md") => active_command.output.clone(),
+                Some(ext) => format!(
+                    "```{ext}\n{}\n```\n",
+                    active_command.output.trim_end_matches('\n')
+                ),
+                None => format!(
+                    "```sh\n{}\n```\n",
+                    active_command.output.trim_end_matches('\n')
+                ),
+            };
+            ToolCallUpdate::new(
+                active_command.tool_call_id.clone(),
+                ToolCallUpdateFields::new().content(vec![content.into()]),
+            )
+        };
+
+        client.send_tool_call_update(update).await;
+    }
+
     #[expect(clippy::too_many_lines)]
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.event_count += 1;
+        self.ensure_run_started_logged(client);
+        self.handle_watchdog_tick(client).await;
 
         // Complete any previous web search before starting a new one
         match &event {
-            EventMsg::Error(..)
-            | EventMsg::StreamError(..)
-            | EventMsg::WebSearchBegin(..)
+            EventMsg::WebSearchBegin(..)
             | EventMsg::UserMessage(..)
             | EventMsg::ExecApprovalRequest(..)
             | EventMsg::ExecCommandBegin(..)
@@ -1123,10 +1743,8 @@ impl PromptState {
             | EventMsg::TurnComplete(..)
             | EventMsg::TokenCount(..)
             | EventMsg::TurnDiff(..)
-            | EventMsg::TurnAborted(..)
             | EventMsg::EnteredReviewMode(..)
-            | EventMsg::ExitedReviewMode(..)
-            | EventMsg::ShutdownComplete => {
+            | EventMsg::ExitedReviewMode(..) => {
                 self.complete_web_search(client).await;
             }
             _ => {}
@@ -1153,31 +1771,36 @@ impl PromptState {
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { thread_id, turn_id, item_id, delta }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta).await;
+                self.maybe_log_model_resumed(client);
+                self.emit_agent_text_for_ui(client, delta).await;
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent { thread_id, turn_id, item_id, delta, summary_index: index })
             | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent { thread_id, turn_id, item_id, delta, content_index: index }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
+                self.maybe_log_model_resumed(client);
                 client.send_agent_thought(delta).await;
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent { item_id, summary_index}) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
+                self.maybe_log_model_resumed(client);
                 client.send_agent_thought("\n\n").await;
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
-                    client.send_agent_text(message).await;
+                    self.maybe_log_model_resumed(client);
+                    self.emit_agent_text_for_ui(client, message).await;
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
+                    self.maybe_log_model_resumed(client);
                     client.send_agent_thought(text).await;
                 }
             }
@@ -1258,6 +1881,9 @@ impl PromptState {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
+                self.flush_final_agent_text_if_needed(client).await;
+                self.fail_open_tool_calls(client, "turn_complete_cleanup").await;
+                self.mark_final_emitted(client, "end_turn");
                 self.finish_with_result(Ok(StopReason::EndTurn));
             }
             EventMsg::UndoStarted(event) => {
@@ -1279,9 +1905,14 @@ impl PromptState {
             }
             EventMsg::StreamError(StreamErrorEvent { message , codex_error_info, additional_details }) => {
                 error!("Handled error during turn: {message} {codex_error_info:?} {additional_details:?}");
+                self.fail_open_tool_calls(client, "stream_error").await;
+                self.mark_final_emitted(client, "cancelled_stream_error");
+                self.finish_with_result(Ok(StopReason::Cancelled));
             }
             EventMsg::Error(ErrorEvent { message, codex_error_info }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
+                self.fail_open_tool_calls(client, "error_event").await;
+                self.mark_final_emitted(client, "error");
                 self.finish_with_result(Err(
                     Error::internal_error()
                         .data(json!({ "message": message, "codex_error_info": codex_error_info })),
@@ -1289,24 +1920,32 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason }) => {
                 info!("Turn aborted: {reason:?}");
+                self.fail_open_tool_calls(client, "turn_aborted").await;
+                self.mark_final_emitted(client, "cancelled_turn_aborted");
                 self.finish_with_result(Ok(StopReason::Cancelled));
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
+                self.fail_open_tool_calls(client, "shutdown_complete").await;
+                self.mark_final_emitted(client, "cancelled_shutdown");
                 self.finish_with_result(Ok(StopReason::Cancelled));
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
                 let display_path = path.display().to_string();
                 client
-                    .send_notification(
-                        SessionUpdate::ToolCall(
-                            ToolCall::new(call_id, format!("View Image {display_path}"))
-                                .kind(ToolKind::Read).status(ToolCallStatus::Completed)
-                                .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
-                            )
-                        )
-                    )]).locations(vec![ToolCallLocation::new(path)])))
+                    .send_tool_call(
+                        ToolCall::new(call_id, format!("View Image {display_path}"))
+                            .kind(ToolKind::Read)
+                            .status(ToolCallStatus::Completed)
+                            .content(vec![ToolCallContent::Content(Content::new(
+                                ContentBlock::ResourceLink(ResourceLink::new(
+                                    display_path.clone(),
+                                    display_path.clone(),
+                                )),
+                            ))])
+                            .locations(vec![ToolCallLocation::new(path)]),
+                    )
                     .await;
             }
             EventMsg::EnteredReviewMode(review_request) => {
@@ -1445,14 +2084,14 @@ impl PromptState {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         client
-            .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            .send_tool_call_update(ToolCallUpdate::new(
                 tool_call_id,
                 ToolCallUpdateFields::new().status(if decision == ElicitationAction::Accept {
                     ToolCallStatus::Completed
                 } else {
                     ToolCallStatus::Failed
                 }),
-            )))
+            ))
             .await;
 
         Ok(())
@@ -1548,7 +2187,7 @@ impl PromptState {
         Ok(())
     }
 
-    async fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
+    async fn start_patch_apply(&mut self, client: &SessionClient, event: PatchApplyBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -1561,7 +2200,7 @@ impl PromptState {
 
         client
             .send_tool_call(
-                ToolCall::new(call_id, title)
+                ToolCall::new(call_id.clone(), title)
                     .kind(ToolKind::Edit)
                     .status(ToolCallStatus::InProgress)
                     .locations(locations)
@@ -1569,10 +2208,11 @@ impl PromptState {
                     .raw_input(raw_input),
             )
             .await;
+        self.mark_tool_call_started(client, &call_id, "patch_apply");
     }
 
-    async fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
-        let raw_output = serde_json::json!(&event);
+    async fn end_patch_apply(&mut self, client: &SessionClient, event: PatchApplyEndEvent) {
+        let raw_output = cap_json_payload_for_ui(serde_json::json!(&event), "patch_apply_end");
         let PatchApplyEndEvent {
             call_id,
             stdout: _,
@@ -1588,26 +2228,35 @@ impl PromptState {
         } else {
             (None, None, None)
         };
+        let status = if success {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        };
+        let kind = self
+            .open_tool_calls
+            .get(&call_id)
+            .map(|open| open.kind)
+            .unwrap_or("patch_apply");
+        self.mark_tool_exec_finished(client, &call_id, kind, status, None, None);
 
         client
             .send_tool_call_update(ToolCallUpdate::new(
-                call_id,
+                call_id.clone(),
                 ToolCallUpdateFields::new()
-                    .status(if success {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    })
+                    .status(status)
                     .raw_output(raw_output)
                     .title(title)
                     .locations(locations)
                     .content(content),
             ))
             .await;
+        self.open_tool_calls.remove(&call_id);
+        self.mark_tool_result_sent(client, &call_id, status, None);
     }
 
     async fn start_mcp_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         invocation: McpInvocation,
@@ -1615,15 +2264,16 @@ impl PromptState {
         let title = format!("Tool: {}/{}", invocation.server, invocation.tool);
         client
             .send_tool_call(
-                ToolCall::new(call_id, title)
+                ToolCall::new(call_id.clone(), title)
                     .status(ToolCallStatus::InProgress)
                     .raw_input(serde_json::json!(&invocation)),
             )
             .await;
+        self.mark_tool_call_started(client, &call_id, "mcp_tool_call");
     }
 
     async fn end_mcp_tool_call(
-        &self,
+        &mut self,
         client: &SessionClient,
         call_id: String,
         result: Result<CallToolResult, String>,
@@ -1636,16 +2286,24 @@ impl PromptState {
             Ok(result) => serde_json::json!(result),
             Err(err) => serde_json::json!(err),
         };
+        let raw_output = cap_json_payload_for_ui(raw_output, "mcp_tool_call_end");
+        let status = if is_error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
+        let kind = self
+            .open_tool_calls
+            .get(&call_id)
+            .map(|open| open.kind)
+            .unwrap_or("mcp_tool_call");
+        self.mark_tool_exec_finished(client, &call_id, kind, status, None, None);
 
         client
             .send_tool_call_update(ToolCallUpdate::new(
-                call_id,
+                call_id.clone(),
                 ToolCallUpdateFields::new()
-                    .status(if is_error {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    })
+                    .status(status)
                     .raw_output(raw_output)
                     .content(result.ok().filter(|result| !result.content.is_empty()).map(
                         |result| {
@@ -1658,6 +2316,8 @@ impl PromptState {
                     )),
             ))
             .await;
+        self.open_tool_calls.remove(&call_id);
+        self.mark_tool_result_sent(client, &call_id, status, None);
     }
 
     async fn exec_approval(
@@ -1680,18 +2340,10 @@ impl PromptState {
         let tool_call_id = ToolCallId::new(call_id.clone());
         let ParseCommandToolCall {
             title,
-            terminal_output,
-            file_extension,
             locations,
             kind,
+            ..
         } = parse_command_tool_call(parsed_cmd, &cwd);
-        self.active_command = Some(ActiveCommand {
-            call_id,
-            terminal_output,
-            tool_call_id: tool_call_id.clone(),
-            output: String::new(),
-            file_extension,
-        });
 
         let mut content = vec![];
 
@@ -1777,6 +2429,19 @@ impl PromptState {
             parsed_cmd,
             process_id: _,
         } = event;
+        if let Some(previous_call_id) = self
+            .active_command
+            .as_ref()
+            .map(|active| active.call_id.clone())
+        {
+            self.fail_tool_call_with_reason(
+                client,
+                &previous_call_id,
+                "superseded_by_new_exec_command",
+            )
+            .await;
+        }
+
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
         let ParseCommandToolCall {
@@ -1791,6 +2456,11 @@ impl PromptState {
             call_id: call_id.clone(),
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
+            visible_output_bytes: 0,
+            output_limit_bytes: Self::exec_output_limit_bytes_from_env(),
+            output_truncated: false,
+            truncation_notice_sent: false,
+            pending_utf8_bytes: Vec::new(),
             file_extension,
             terminal_output,
         };
@@ -1799,7 +2469,7 @@ impl PromptState {
             let meta = Some(Meta::from_iter([(
                 "terminal_info".to_owned(),
                 serde_json::json!({
-                    "terminal_id": call_id,
+                    "terminal_id": call_id.clone(),
                     "cwd": cwd
                 }),
             )]));
@@ -1821,6 +2491,7 @@ impl PromptState {
                     .meta(meta),
             )
             .await;
+        self.mark_tool_call_started(client, &call_id, "exec_command");
     }
 
     async fn exec_command_output_delta(
@@ -1837,45 +2508,14 @@ impl PromptState {
         if let Some(active_command) = &mut self.active_command
             && *active_command.call_id == call_id
         {
-            let data_str = String::from_utf8_lossy(&chunk).to_string();
-
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": data_str
-                    }),
-                )]))
-            } else {
-                active_command.output.push_str(&data_str);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update).await;
+            let data_str =
+                decode_utf8_streaming(&mut active_command.pending_utf8_bytes, &chunk, false);
+            Self::emit_exec_output_update(client, active_command, &call_id, data_str).await;
         }
     }
 
     async fn exec_command_end(&mut self, client: &SessionClient, event: ExecCommandEndEvent) {
-        let raw_output = serde_json::json!(&event);
+        let raw_output = cap_json_payload_for_ui(serde_json::json!(&event), "exec_command_end");
         let ExecCommandEndEvent {
             turn_id: _,
             command: _,
@@ -1892,37 +2532,87 @@ impl PromptState {
             formatted_output: _,
             process_id: _,
         } = event;
-        if let Some(active_command) = self.active_command.take()
-            && active_command.call_id == call_id
-        {
-            let is_success = exit_code == 0;
+        let status = if exit_code == 0 {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        };
 
-            client
-                .send_tool_call_update(
-                    ToolCallUpdate::new(
-                        active_command.tool_call_id.clone(),
-                        ToolCallUpdateFields::new()
-                            .status(if is_success {
-                                ToolCallStatus::Completed
-                            } else {
-                                ToolCallStatus::Failed
-                            })
-                            .raw_output(raw_output),
+        if let Some(active_command) = self.active_command.take() {
+            if active_command.call_id == call_id {
+                let mut active_command = active_command;
+                let trailing =
+                    decode_utf8_streaming(&mut active_command.pending_utf8_bytes, &[], true);
+                Self::emit_exec_output_update(client, &mut active_command, &call_id, trailing)
+                    .await;
+                let kind = self
+                    .open_tool_calls
+                    .get(&call_id)
+                    .map(|open| open.kind)
+                    .unwrap_or("exec_command");
+                self.mark_tool_exec_finished(client, &call_id, kind, status, Some(exit_code), None);
+
+                client
+                    .send_tool_call_update(
+                        ToolCallUpdate::new(
+                            active_command.tool_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .raw_output(raw_output),
+                        )
+                        .meta(
+                            client.supports_terminal_output(&active_command).then(|| {
+                                Meta::from_iter([(
+                                    "terminal_exit".into(),
+                                    serde_json::json!({
+                                        "terminal_id": call_id,
+                                        "exit_code": exit_code,
+                                        "signal": null
+                                    }),
+                                )])
+                            }),
+                        ),
                     )
-                    .meta(
-                        client.supports_terminal_output(&active_command).then(|| {
-                            Meta::from_iter([(
-                                "terminal_exit".into(),
-                                serde_json::json!({
-                                    "terminal_id": call_id,
-                                    "exit_code": exit_code,
-                                    "signal": null
-                                }),
-                            )])
-                        }),
-                    ),
-                )
-                .await;
+                    .await;
+                self.open_tool_calls.remove(&call_id);
+                self.mark_tool_result_sent(client, &call_id, status, None);
+            } else {
+                warn!(
+                    "ExecCommandEnd call_id mismatch: active={} incoming={}",
+                    active_command.call_id, call_id
+                );
+                self.active_command = Some(active_command);
+                if self.open_tool_calls.contains_key(&call_id) {
+                    let kind = self
+                        .open_tool_calls
+                        .get(&call_id)
+                        .map(|open| open.kind)
+                        .unwrap_or("exec_command");
+                    self.mark_tool_exec_finished(
+                        client,
+                        &call_id,
+                        kind,
+                        status,
+                        Some(exit_code),
+                        Some("call_id_mismatch_fallback"),
+                    );
+                    client
+                        .send_tool_call_update(ToolCallUpdate::new(
+                            call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .raw_output(raw_output),
+                        ))
+                        .await;
+                    self.open_tool_calls.remove(&call_id);
+                    self.mark_tool_result_sent(
+                        client,
+                        &call_id,
+                        status,
+                        Some("call_id_mismatch_fallback"),
+                    );
+                }
+            }
         }
     }
 
@@ -1942,46 +2632,18 @@ impl PromptState {
         if let Some(active_command) = &mut self.active_command
             && *active_command.call_id == call_id
         {
-            let update = if client.supports_terminal_output(active_command) {
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": stdin
-                    }),
-                )]))
-            } else {
-                active_command.output.push_str(&stdin);
-                let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                };
-                ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new().content(vec![content.into()]),
-                )
-            };
-
-            client.send_tool_call_update(update).await;
+            Self::emit_exec_output_update(client, active_command, &call_id, stdin).await;
         }
     }
 
     async fn start_web_search(&mut self, client: &SessionClient, call_id: String) {
         self.active_web_search = Some(call_id.clone());
         client
-            .send_tool_call(ToolCall::new(call_id, "Searching the Web").kind(ToolKind::Fetch))
+            .send_tool_call(
+                ToolCall::new(call_id.clone(), "Searching the Web").kind(ToolKind::Fetch),
+            )
             .await;
+        self.mark_tool_call_started(client, &call_id, "web_search");
     }
 
     async fn update_web_search_query(
@@ -2005,12 +2667,27 @@ impl PromptState {
 
     async fn complete_web_search(&mut self, client: &SessionClient) {
         if let Some(call_id) = self.active_web_search.take() {
+            let kind = self
+                .open_tool_calls
+                .get(&call_id)
+                .map(|open| open.kind)
+                .unwrap_or("web_search");
+            self.mark_tool_exec_finished(
+                client,
+                &call_id,
+                kind,
+                ToolCallStatus::Completed,
+                None,
+                None,
+            );
             client
                 .send_tool_call_update(ToolCallUpdate::new(
-                    call_id,
+                    call_id.clone(),
                     ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
                 ))
                 .await;
+            self.open_tool_calls.remove(&call_id);
+            self.mark_tool_result_sent(client, &call_id, ToolCallStatus::Completed, None);
         }
     }
 }
@@ -2111,6 +2788,18 @@ impl TaskState {
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.prompt.handle_event(client, event).await;
     }
+
+    async fn handle_watchdog_tick(&mut self, client: &SessionClient) {
+        self.prompt.handle_watchdog_tick(client).await;
+    }
+
+    async fn fail_open_tool_calls(&mut self, client: &SessionClient, reason: &str) {
+        self.prompt.fail_open_tool_calls(client, reason).await;
+    }
+
+    async fn force_cancelled(&mut self, client: &SessionClient, reason: &str) {
+        self.prompt.force_cancelled(client, reason).await;
+    }
 }
 
 #[derive(Clone)]
@@ -2119,6 +2808,7 @@ struct SessionClient {
     client: Arc<dyn Client>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     session_store: Option<SessionStore>,
+    ui_visibility_mode: UiVisibilityMode,
 }
 
 impl SessionClient {
@@ -2132,6 +2822,7 @@ impl SessionClient {
             client: ACP_CLIENT.get().expect("Client should be set").clone(),
             client_capabilities,
             session_store,
+            ui_visibility_mode: UiVisibilityMode::from_env(),
         }
     }
 
@@ -2147,6 +2838,7 @@ impl SessionClient {
             client,
             client_capabilities,
             session_store,
+            ui_visibility_mode: UiVisibilityMode::from_env(),
         }
     }
 
@@ -2154,6 +2846,14 @@ impl SessionClient {
         if let Some(store) = self.session_store.as_ref() {
             store.log(kind, data);
         }
+    }
+
+    fn ui_visibility_mode(&self) -> UiVisibilityMode {
+        self.ui_visibility_mode
+    }
+
+    fn hides_internal_updates(&self) -> bool {
+        self.ui_visibility_mode.hides_internal_updates()
     }
 
     fn supports_terminal_output(&self, active_command: &ActiveCommand) -> bool {
@@ -2191,16 +2891,22 @@ impl SessionClient {
 
     async fn send_agent_text(&self, text: impl Into<String>) {
         let text = text.into();
-        self.log_canonical("acp.agent_message_chunk", json!({ "text": text }));
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            text.into(),
-        )))
-        .await;
+        let max_chars = ui_text_chunk_max_chars_from_env();
+        for chunk in split_text_for_ui_chunks(&text, max_chars) {
+            self.log_canonical("acp.agent_message_chunk", json!({ "text": &chunk }));
+            self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                chunk.into(),
+            )))
+            .await;
+        }
     }
 
     async fn send_agent_thought(&self, text: impl Into<String>) {
         let text = text.into();
         self.log_canonical("acp.agent_thought_chunk", json!({ "text": text }));
+        if self.hides_internal_updates() {
+            return;
+        }
         self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             text.into(),
         )))
@@ -2208,23 +2914,31 @@ impl SessionClient {
     }
 
     async fn send_tool_call(&self, tool_call: ToolCall) {
+        let tool_call = cap_tool_call_payloads_for_ui(tool_call);
         let value = serde_json::to_value(&tool_call).unwrap_or_else(|_| {
             json!({
                 "debug": format!("{tool_call:?}")
             })
         });
         self.log_canonical("acp.tool_call", value);
+        if self.hides_internal_updates() {
+            return;
+        }
         self.send_notification(SessionUpdate::ToolCall(tool_call))
             .await;
     }
 
     async fn send_tool_call_update(&self, update: ToolCallUpdate) {
+        let update = cap_tool_call_update_payloads_for_ui(update);
         let value = serde_json::to_value(&update).unwrap_or_else(|_| {
             json!({
                 "debug": format!("{update:?}")
             })
         });
         self.log_canonical("acp.tool_call_update", value);
+        if self.hides_internal_updates() {
+            return;
+        }
         self.send_notification(SessionUpdate::ToolCallUpdate(update))
             .await;
     }
@@ -2277,6 +2991,9 @@ impl SessionClient {
             data["explanation"] = serde_json::Value::String(explanation);
         }
         self.log_canonical("acp.plan", data);
+        if self.hides_internal_updates() {
+            return;
+        }
         self.send_notification(SessionUpdate::Plan(Plan::new(
             plan.into_iter()
                 .map(|entry| {
@@ -2393,6 +3110,9 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn spawn(mut self) {
+        let mut watchdog_tick =
+            tokio::time::interval(Duration::from_secs(TOOL_CALL_WATCHDOG_TICK_SECONDS));
+        watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
@@ -2406,12 +3126,76 @@ impl<A: Auth> ThreadActor<A> {
                         error!("Error getting next event: {:?}", e);
                         break;
                     }
-                }
+                },
+                _ = watchdog_tick.tick() => self.handle_watchdog_tick().await,
             }
             // Litter collection of senders with no receivers
             self.submissions
                 .retain(|_, submission| submission.is_active());
         }
+    }
+
+    async fn handle_watchdog_tick(&mut self) {
+        for submission in self.submissions.values_mut() {
+            submission.handle_watchdog_tick(&self.client).await;
+        }
+    }
+
+    async fn fail_open_tool_calls(&mut self, reason: &str) {
+        for submission in self.submissions.values_mut() {
+            submission.fail_open_tool_calls(&self.client, reason).await;
+        }
+    }
+
+    async fn preempt_active_runs_before_prompt(&mut self) -> Result<(), Error> {
+        if !self.task_monitoring.preempt_on_new_prompt {
+            return Ok(());
+        }
+
+        let active_submission_ids = self
+            .submissions
+            .iter()
+            .filter_map(|(submission_id, state)| {
+                (state.monitor_label().is_some() && state.is_active())
+                    .then_some(submission_id.clone())
+            })
+            .collect::<Vec<_>>();
+        if active_submission_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.client.log_canonical(
+            "acp.bridge.preempt_before_prompt",
+            json!({
+                "active_submission_ids": active_submission_ids.clone(),
+            }),
+        );
+
+        self.handle_cancel().await?;
+        self.fail_open_tool_calls("preempted_by_new_prompt").await;
+
+        for submission_id in &active_submission_ids {
+            if let Some(mut state) = self.submissions.remove(submission_id) {
+                state
+                    .force_cancelled(&self.client, "preempted_by_new_prompt")
+                    .await;
+            }
+        }
+
+        if self
+            .context_optimization
+            .auto_compact_submission_id
+            .as_ref()
+            .is_some_and(|id| {
+                active_submission_ids
+                    .iter()
+                    .any(|active_id| active_id == id)
+            })
+        {
+            self.context_optimization.auto_compact_submission_id = None;
+        }
+
+        Ok(())
     }
 
     async fn handle_message(&mut self, message: ThreadMessage) {
@@ -2517,6 +3301,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ThreadMessage::Cancel { response_tx } => {
                 let result = self.handle_cancel().await;
+                self.fail_open_tool_calls("cancel_requested").await;
                 drop(response_tx.send(result));
             }
             ThreadMessage::ReplayHistory {
@@ -2929,6 +3714,28 @@ impl<A: Auth> ThreadActor<A> {
                     .category(SessionConfigOptionCategory::Other)
                     .description("Enable or disable progress vector checks"),
                 );
+
+                options.push(
+                    SessionConfigOption::select(
+                        "preempt_on_new_prompt",
+                        "New Prompt Preemption",
+                        if self.task_monitoring.preempt_on_new_prompt {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        vec![
+                            SessionConfigSelectOption::new("on", "On").description(
+                                "Cancel in-flight runs before starting a new prompt (recommended for bridge stability)",
+                            ),
+                            SessionConfigSelectOption::new("off", "Off").description(
+                                "Allow existing runs to continue when a new prompt is submitted",
+                            ),
+                        ],
+                    )
+                    .category(SessionConfigOptionCategory::Other)
+                    .description("Controls whether new prompts preempt currently running submissions"),
+                );
             }
 
             if show_beta {
@@ -3065,6 +3872,7 @@ impl<A: Auth> ThreadActor<A> {
             "task_orchestration_mode" => self.handle_set_task_orchestration_mode(value).await,
             "task_monitoring_enabled" => self.handle_set_task_monitoring_mode(value).await,
             "task_vector_check_enabled" => self.handle_set_task_vector_check_enabled(value).await,
+            "preempt_on_new_prompt" => self.handle_set_preempt_on_new_prompt(value).await,
             _ if parse_experimental_feature_config_id(&raw_config_id).is_some() => {
                 let spec = parse_experimental_feature_config_id(&raw_config_id)
                     .ok_or_else(|| Error::invalid_params().data("Unsupported beta feature"))?;
@@ -3300,6 +4108,21 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
+    async fn handle_set_preempt_on_new_prompt(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let enabled = parse_on_off_toggle(value.0.as_ref(), "New Prompt Preemption")?;
+        self.task_monitoring.preempt_on_new_prompt = enabled;
+        self.client.log_canonical(
+            "acp.task_monitoring.preempt_on_new_prompt",
+            json!({
+                "enabled": enabled,
+            }),
+        );
+        Ok(())
+    }
+
     async fn handle_set_beta_feature(
         &mut self,
         spec: ExperimentalFeatureSpec,
@@ -3430,6 +4253,14 @@ impl<A: Auth> ThreadActor<A> {
         lines.push(format!(
             "- Progress vector checks default: `{}`",
             if self.task_monitoring.vector_check_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        lines.push(format!(
+            "- New prompt preemption default: `{}`",
+            if self.task_monitoring.preempt_on_new_prompt {
                 "on"
             } else {
                 "off"
@@ -3580,14 +4411,19 @@ impl<A: Auth> ThreadActor<A> {
     fn render_task_monitoring_snapshot(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!(
-            "Task monitoring: orchestration={}, monitor={}, vector_checks={}",
+            "Task monitoring: orchestration={}, monitor={}, vector_checks={}, preempt_on_new_prompt={}",
             self.task_monitoring.orchestration_mode.as_config_value(),
             self.task_monitoring.monitor_mode.as_config_value(),
             if self.task_monitoring.vector_check_enabled {
                 "on"
             } else {
                 "off"
-            }
+            },
+            if self.task_monitoring.preempt_on_new_prompt {
+                "on"
+            } else {
+                "off"
+            },
         ));
 
         if !self.task_monitoring.monitor_mode.is_enabled() {
@@ -3701,10 +4537,15 @@ impl<A: Auth> ThreadActor<A> {
             .filter(|state| state.monitor_label().is_some() && state.is_active())
             .count();
         let status_strip = format!(
-            "Status strip: orchestration={} | monitor={} | vector_checks={} | active_tasks={} | context={}@{}% | detail={}",
+            "Status strip: orchestration={} | monitor={} | vector_checks={} | preempt={} | active_tasks={} | context={}@{}% | detail={}",
             self.task_monitoring.orchestration_mode.as_config_value(),
             self.task_monitoring.monitor_mode.as_config_value(),
             if self.task_monitoring.vector_check_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if self.task_monitoring.preempt_on_new_prompt {
                 "on"
             } else {
                 "off"
@@ -4042,12 +4883,13 @@ impl<A: Auth> ThreadActor<A> {
                     let (x, y, magnitude, heading, semantic) = self.flow_vector.resultant_vector();
                     self.client
                         .send_agent_text(format!(
-                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}\n- context_optimization: {} (trigger {}%)\n- task_orchestration: {}\n- task_monitoring: {}\n- progress_vector_checks: {}\n- workflow_vector: ({x}, {y}), |v|={magnitude:.2}, heading={heading}\n- workflow_semantic: {semantic}",
+                            "Session status:\n- model: {current_model}\n- reasoning_effort: {effort}\n- personality: {personality}\n- approval_preset: {approval_preset}\n- context_optimization: {} (trigger {}%)\n- task_orchestration: {}\n- task_monitoring: {}\n- progress_vector_checks: {}\n- preempt_on_new_prompt: {}\n- workflow_vector: ({x}, {y}), |v|={magnitude:.2}, heading={heading}\n- workflow_semantic: {semantic}",
                             self.context_optimization.mode.as_config_value(),
                             self.context_optimization.trigger_percent,
                             self.task_monitoring.orchestration_mode.as_config_value(),
                             self.task_monitoring.monitor_mode.as_config_value(),
                             if self.task_monitoring.vector_check_enabled { "on" } else { "off" },
+                            if self.task_monitoring.preempt_on_new_prompt { "on" } else { "off" },
                         ))
                         .await;
                     self.maybe_emit_setup_wizard_plan_update(Some(
@@ -4206,6 +5048,8 @@ impl<A: Auth> ThreadActor<A> {
                 final_output_json_schema: None,
             }
         }
+
+        self.preempt_active_runs_before_prompt().await?;
 
         if matches!(
             self.task_monitoring.orchestration_mode,
@@ -5657,6 +6501,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_decode_utf8_streaming_preserves_split_multibyte_sequence() {
+        let mut pending = Vec::new();
+
+        let first = decode_utf8_streaming(&mut pending, &[0xE2, 0x82], false);
+        assert_eq!(first, "");
+        assert_eq!(pending, vec![0xE2, 0x82]);
+
+        let second = decode_utf8_streaming(&mut pending, &[0xAC], false);
+        assert_eq!(second, "€");
+        assert!(pending.is_empty());
+    }
+
     #[tokio::test]
     async fn test_replay_history_normalizes_namespaced_custom_tool_name() -> anyhow::Result<()> {
         let (_session_id, client, _thread, message_tx, local_set) = setup(vec![]).await?;
@@ -5794,7 +6651,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_slash_command_smoke_flow() -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _visibility_restore = EnvVarRestore::set("ACP_UI_VISIBILITY_MODE", Some("full"));
+        let _chunk_restore = EnvVarRestore::set("ACP_UI_TEXT_CHUNK_MAX_CHARS", Some("12000"));
+
         let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
 
         async fn send_prompt(
@@ -6175,6 +7040,64 @@ mod tests {
                 .contains("Task queue:"),
             "auto mode should suppress task queue output when no active tasks exist. snapshot={:?}",
             actor.render_task_monitoring_snapshot()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_prompt_preempts_active_submission_when_enabled() -> anyhow::Result<()> {
+        let session_id = SessionId::new("preempt-test");
+        let client = Arc::new(StubClient::new());
+        let thread = Arc::new(StubCodexThread::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client, Arc::default(), None);
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread.clone(),
+            models_manager,
+            config,
+            message_rx,
+        );
+        actor.task_monitoring.preempt_on_new_prompt = true;
+
+        let (old_response_tx, old_response_rx) = tokio::sync::oneshot::channel();
+        actor.submissions.insert(
+            "old-submission".to_string(),
+            SubmissionState::Prompt(PromptState::new(
+                thread.clone(),
+                old_response_tx,
+                "old-submission".to_string(),
+            )),
+        );
+
+        let _new_response_rx = actor
+            .handle_prompt(PromptRequest::new(session_id, vec!["new request".into()]))
+            .await?;
+
+        let old_stop_reason = old_response_rx.await??;
+        assert_eq!(old_stop_reason, StopReason::Cancelled);
+        assert!(
+            !actor.submissions.contains_key("old-submission"),
+            "expected previous submission to be removed after preemption"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(
+            matches!(ops.first(), Some(Op::Interrupt)),
+            "expected preemption to issue Op::Interrupt before new prompt. ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::UserInput { .. })),
+            "expected new prompt submission after preemption. ops={ops:?}"
         );
 
         Ok(())
@@ -6731,6 +7654,7 @@ mod tests {
         assert!(!has_option(&options, "task_orchestration_mode"));
         assert!(!has_option(&options, "task_monitoring_enabled"));
         assert!(!has_option(&options, "task_vector_check_enabled"));
+        assert!(!has_option(&options, "preempt_on_new_prompt"));
         assert!(
             !options.iter().any(|option| option
                 .id
@@ -6761,6 +7685,7 @@ mod tests {
         assert!(!has_option(&options, "task_orchestration_mode"));
         assert!(!has_option(&options, "task_monitoring_enabled"));
         assert!(!has_option(&options, "task_vector_check_enabled"));
+        assert!(!has_option(&options, "preempt_on_new_prompt"));
         assert!(
             !options.iter().any(|option| option
                 .id
@@ -6794,6 +7719,7 @@ mod tests {
         assert!(has_option(&options, "task_orchestration_mode"));
         assert!(has_option(&options, "task_monitoring_enabled"));
         assert!(has_option(&options, "task_vector_check_enabled"));
+        assert!(has_option(&options, "preempt_on_new_prompt"));
         assert!(
             !options.iter().any(|option| option
                 .id
@@ -6824,6 +7750,7 @@ mod tests {
         assert!(has_option(&options, "task_orchestration_mode"));
         assert!(has_option(&options, "task_monitoring_enabled"));
         assert!(has_option(&options, "task_vector_check_enabled"));
+        assert!(has_option(&options, "preempt_on_new_prompt"));
         assert!(
             options
                 .iter()
@@ -7582,6 +8509,341 @@ mod tests {
         Ok(())
     }
 
+    fn test_exec_begin_event(call_id: &str) -> ExecCommandBeginEvent {
+        ExecCommandBeginEvent {
+            call_id: call_id.to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: vec!["sleep".to_string(), "300".to_string()],
+            cwd: PathBuf::from("/tmp/repo"),
+            parsed_cmd: vec![ParsedCommand::Unknown {
+                cmd: "sleep 300".to_string(),
+            }],
+            source: codex_core::protocol::ExecCommandSource::UserShell,
+            interaction_input: None,
+        }
+    }
+
+    fn test_exec_end_event(call_id: &str, exit_code: i32) -> ExecCommandEndEvent {
+        ExecCommandEndEvent {
+            call_id: call_id.to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command: vec!["sleep".to_string(), "300".to_string()],
+            cwd: PathBuf::from("/tmp/repo"),
+            parsed_cmd: vec![ParsedCommand::Unknown {
+                cmd: "sleep 300".to_string(),
+            }],
+            source: codex_core::protocol::ExecCommandSource::UserShell,
+            interaction_input: None,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            aggregated_output: "ok".to_string(),
+            exit_code,
+            duration: std::time::Duration::from_millis(1),
+            formatted_output: "ok".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_final_only_visibility_hides_internal_updates() -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _visibility_restore = EnvVarRestore::set("ACP_UI_VISIBILITY_MODE", Some("final_only"));
+
+        let session_id = SessionId::new("final-only-visibility");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-final-only".to_string());
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    summary_index: 0,
+                    delta: "Thinking hidden".to_string(),
+                }),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event("exec-final-only")),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandEnd(test_exec_end_event("exec-final-only", 0)),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    delta: "final answer".to_string(),
+                }),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                }),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text_chunks,
+            vec!["final answer"],
+            "expected only final answer text when final_only visibility is enabled. notifications={notifications:?}"
+        );
+        assert!(
+            !notifications.iter().any(|notification| matches!(
+                notification.update,
+                SessionUpdate::AgentThoughtChunk(_)
+            )),
+            "final_only visibility should hide thought chunks. notifications={notifications:?}"
+        );
+        assert!(
+            !notifications
+                .iter()
+                .any(|notification| matches!(notification.update, SessionUpdate::ToolCall(_))),
+            "final_only visibility should hide tool calls. notifications={notifications:?}"
+        );
+        assert!(
+            !notifications.iter().any(|notification| matches!(
+                notification.update,
+                SessionUpdate::ToolCallUpdate(_)
+            )),
+            "final_only visibility should hide tool-call updates. notifications={notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_send_agent_text_respects_ui_text_chunk_limit_env() -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _chunk_restore = EnvVarRestore::set("ACP_UI_TEXT_CHUNK_MAX_CHARS", Some("512"));
+
+        let session_id = SessionId::new("chunk-limit-test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+
+        let text = format!("{}{}{}", "a".repeat(512), "b".repeat(512), "c");
+        session_client.send_agent_text(text).await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text_chunks,
+            vec!["a".repeat(512), "b".repeat(512), "c".to_string()],
+            "expected ACP_UI_TEXT_CHUNK_MAX_CHARS to chunk outgoing agent text. notifications={notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_send_tool_call_update_caps_raw_output_for_ui() -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _raw_limit_restore = EnvVarRestore::set("ACP_TOOL_RAW_OUTPUT_MAX_CHARS", Some("2048"));
+
+        let session_id = SessionId::new("raw-output-cap-test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+
+        let oversized_output = json!({
+            "blob": "x".repeat(4096)
+        });
+        session_client
+            .send_tool_call_update(ToolCallUpdate::new(
+                "tool-cap-1",
+                ToolCallUpdateFields::new().raw_output(oversized_output),
+            ))
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let Some(SessionNotification {
+            update: SessionUpdate::ToolCallUpdate(update),
+            ..
+        }) = notifications.last()
+        else {
+            panic!("expected tool call update notification. notifications={notifications:?}");
+        };
+
+        let raw_output = update
+            .fields
+            .raw_output
+            .as_ref()
+            .expect("expected raw_output to be present");
+        assert_eq!(
+            raw_output
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "expected capped payload metadata. raw_output={raw_output:?}"
+        );
+        assert_eq!(
+            raw_output
+                .get("payload")
+                .and_then(serde_json::Value::as_str),
+            Some("tool_call_update.raw_output"),
+            "expected payload marker for capped raw output. raw_output={raw_output:?}"
+        );
+        assert_eq!(
+            raw_output
+                .get("limit_chars")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048),
+            "expected clamp-aware limit marker for capped raw output. raw_output={raw_output:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_state_closes_exec_tool_call_on_turn_aborted() -> anyhow::Result<()> {
+        let session_id = SessionId::new("turn-aborted-test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-1".to_string());
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event("exec-call-1")),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: codex_core::protocol::TurnAbortReason::Interrupted,
+                }),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let saw_tool_call = notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "exec-call-1"
+            )
+        });
+        let saw_failed_update = notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "exec-call-1"
+                        && update.fields.status == Some(ToolCallStatus::Failed)
+            )
+        });
+
+        assert!(
+            saw_tool_call,
+            "expected an in-progress tool call notification"
+        );
+        assert!(
+            saw_failed_update,
+            "expected failed tool-call update on turn aborted. notifications={notifications:?}"
+        );
+        assert!(
+            state.open_tool_calls.is_empty(),
+            "expected no dangling open tool calls"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_state_watchdog_times_out_open_exec_tool_call() -> anyhow::Result<()> {
+        let session_id = SessionId::new("watchdog-test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-2".to_string());
+        state.tool_watchdog_timeout = Duration::from_millis(1);
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event("exec-call-timeout")),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        state.handle_watchdog_tick(&session_client).await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let saw_failed_update = notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "exec-call-timeout"
+                        && update.fields.status == Some(ToolCallStatus::Failed)
+            )
+        });
+
+        assert!(
+            saw_failed_update,
+            "expected failed tool-call update after watchdog timeout. notifications={notifications:?}"
+        );
+        assert!(
+            state.open_tool_calls.is_empty(),
+            "expected watchdog to clear open tool calls"
+        );
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -7979,6 +9241,25 @@ mod tests {
                             }),
                         })
                         .unwrap();
+                }
+                Op::Interrupt => {
+                    let pending_ids = self
+                        .pending_exec
+                        .lock()
+                        .unwrap()
+                        .drain()
+                        .map(|(submission_id, _)| submission_id)
+                        .collect::<Vec<_>>();
+                    for submission_id in pending_ids {
+                        self.op_tx
+                            .send(Event {
+                                id: submission_id,
+                                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                                    reason: codex_core::protocol::TurnAbortReason::Interrupted,
+                                }),
+                            })
+                            .unwrap();
+                    }
                 }
                 _ => {
                     unimplemented!()
