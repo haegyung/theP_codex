@@ -308,25 +308,16 @@ jobs:
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=0
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
-            if [ -f "${NPM_CONFIG_USERCONFIG}" ]; then
-              if ! grep -Eq "^registry=" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "registry=https://registry.npmjs.org/" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-              if ! grep -Fq "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-              if [ -n "${NODE_AUTH_TOKEN:-}" ] && ! grep -Fq "//registry.npmjs.org/:_authToken=" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-            else
-              {
-                echo "registry=https://registry.npmjs.org/"
-                echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
-                if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-                  echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}"
-                fi
-              } > "${NPM_CONFIG_USERCONFIG}"
+            if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NODE_AUTH_TOKEN is not available."
+              echo "Run with setup-node id-token integration and repository trusted publisher settings for scope ${NPM_PUBLISH_OIDC_SCOPE}."
+              exit 1
             fi
+            {
+              echo "registry=https://registry.npmjs.org/"
+              echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
+              echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"
+            } > "${NPM_CONFIG_USERCONFIG}"
             echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
@@ -463,25 +454,16 @@ jobs:
               exit 1
             fi
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
-            if [ -f "${NPM_CONFIG_USERCONFIG}" ]; then
-              if ! grep -Eq "^registry=" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "registry=https://registry.npmjs.org/" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-              if ! grep -Fq "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-              if [ -n "${NODE_AUTH_TOKEN:-}" ] && ! grep -Fq "//registry.npmjs.org/:_authToken=" "${NPM_CONFIG_USERCONFIG}"; then
-                echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" >> "${NPM_CONFIG_USERCONFIG}"
-              fi
-            else
-              {
-                echo "registry=https://registry.npmjs.org/"
-                echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
-                if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
-                  echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}"
-                fi
-              } > "${NPM_CONFIG_USERCONFIG}"
+            if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NODE_AUTH_TOKEN is not available."
+              echo "Run with setup-node id-token integration and repository trusted publisher settings for scope ${NPM_PUBLISH_OIDC_SCOPE}."
+              exit 1
             fi
+            {
+              echo "registry=https://registry.npmjs.org/"
+              echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
+              echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"
+            } > "${NPM_CONFIG_USERCONFIG}"
             echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
