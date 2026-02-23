@@ -8,10 +8,10 @@
   "homepage": "https://github.com/haegyung/xsfire-camp",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/haegyung/xsfire-camp.git"
+    "url": "git+https://github.com/theprometheusxyz/xsfire-camp.git"
   },
   "bugs": {
-    "url": "https://github.com/haegyung/xsfire-camp/issues"
+    "url": "https://github.com/theprometheusxyz/xsfire-camp/issues"
   },
   "keywords": [
     "codex",

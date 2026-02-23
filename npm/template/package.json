@@ -7,7 +7,7 @@
 	"homepage": "https://github.com/haegyung/xsfire-camp",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/haegyung/xsfire-camp.git"
+		"url": "git+https://github.com/theprometheusxyz/xsfire-camp.git"
 	},
 	"bin": {
 		"${PACKAGE_NAME}": "bin/xsfire-camp"
