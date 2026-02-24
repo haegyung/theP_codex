@@ -4,7 +4,7 @@
 	"description": "An ACP-compatible coding agent powered by Codex - ${OS} ${ARCH} binary",
 	"license": "CC-BY-NC-SA-4.0",
 	"author": "haegyung",
-	"homepage": "https://github.com/haegyung/xsfire-camp",
+	"homepage": "https://github.com/theprometheusxyz/xsfire-camp",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/theprometheusxyz/xsfire-camp.git"

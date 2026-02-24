@@ -9,7 +9,7 @@ id = "xsfire-camp"
 version = "0.9.9"
 path = "extensions/xsfire-camp"
 description = "Codex CLI parity ACP adapter with shared CODEX_HOME."
-homepage = "https://github.com/haegyung/xsfire-camp"
+homepage = "https://github.com/theprometheusxyz/xsfire-camp"
 owner = "haegyung"
 ```
 

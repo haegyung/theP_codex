@@ -5,7 +5,7 @@
   "description": "ACP IDE bridge for Codex CLI with structured tool/plan/approval session logs; currently Codex-only, targeting multi-LLM and multi-CLI backends.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "haegyung <g@theprometheus.xyz>",
-  "homepage": "https://github.com/haegyung/xsfire-camp",
+  "homepage": "https://github.com/theprometheusxyz/xsfire-camp",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/theprometheusxyz/xsfire-camp.git"
