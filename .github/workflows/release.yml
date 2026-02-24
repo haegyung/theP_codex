@@ -285,6 +285,29 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         run: npm install -g npm@10
 
+      - name: Resolve npm auth token
+        if: steps.publish_config.outputs.enabled == '1'
+        id: npm_auth_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const raw = String(process.env.NPM_OIDC_PUBLISH || '').toLowerCase();
+            const oidcEnabled = ['1', 'true', 'yes', 'on'].includes(raw);
+
+            if (process.env.NPM_TOKEN && process.env.NPM_TOKEN.length > 0) {
+              return '';
+            }
+
+            if (!oidcEnabled) {
+              return '';
+            }
+
+            return await core.getIDToken('https://registry.npmjs.org');
+
       - name: Download NPM packages
         if: steps.publish_config.outputs.enabled == '1'
         uses: actions/download-artifact@v5
@@ -296,12 +319,12 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
         run: |
           NPM_CONFIG_USERCONFIG="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
 
-          # If NPM_TOKEN is not set, we fall back to npm "trusted publishing" (OIDC) via --provenance.
-          # If neither is configured, npm will fail with ENEEDAUTH.
+          # If NPM_TOKEN is set, use it directly; otherwise use OIDC token.
           NPM_OIDC_PUBLISH_ENABLED=0
           case "${NPM_OIDC_PUBLISH,,}" in
             1|true|yes|on)
@@ -430,6 +453,29 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         run: npm install -g npm@10
 
+      - name: Resolve npm auth token
+        if: steps.publish_config.outputs.enabled == '1'
+        id: npm_auth_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const raw = String(process.env.NPM_OIDC_PUBLISH || '').toLowerCase();
+            const oidcEnabled = ['1', 'true', 'yes', 'on'].includes(raw);
+
+            if (process.env.NPM_TOKEN && process.env.NPM_TOKEN.length > 0) {
+              return '';
+            }
+
+            if (!oidcEnabled) {
+              return '';
+            }
+
+            return await core.getIDToken('https://registry.npmjs.org');
+
       - name: Download base package
         if: steps.publish_config.outputs.enabled == '1'
         uses: actions/download-artifact@v5
@@ -447,6 +493,7 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
         run: |
           NPM_CONFIG_USERCONFIG="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
