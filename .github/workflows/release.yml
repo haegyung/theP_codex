@@ -18,6 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   NPM_PUBLISH_OIDC_SCOPE: ${{ vars.NPM_PUBLISH_OIDC_SCOPE || '@haegyung' }}
   NPM_PUBLISH_OIDC_REPO: ${{ vars.NPM_PUBLISH_OIDC_REPO || 'theprometheusxyz/xsfire-camp' }}
+  NPM_PUBLISH_OIDC_AUDIENCE: ${{ vars.NPM_PUBLISH_OIDC_AUDIENCE || 'https://registry.npmjs.org' }}
   NPM_PUBLISH_OIDC_SCOPE_EXPECTED: "@haegyung"
   NPM_PUBLISH_OIDC_REPO_EXPECTED: "theprometheusxyz/xsfire-camp"
 
@@ -291,12 +292,21 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+          NPM_PUBLISH_OIDC_AUDIENCE: ${{ env.NPM_PUBLISH_OIDC_AUDIENCE }}
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
             const raw = String(process.env.NPM_OIDC_PUBLISH || '').toLowerCase();
+            const audience = String(process.env.NPM_PUBLISH_OIDC_AUDIENCE || 'https://registry.npmjs.org');
             const oidcEnabled = ['1', 'true', 'yes', 'on'].includes(raw);
+            const decodeJwtPayload = (tokenPart) => {
+              const normalized = tokenPart
+                .replace(/-/g, "+")
+                .replace(/_/g, "/")
+                .padEnd(tokenPart.length + ((4 - (tokenPart.length % 4)) % 4), "=");
+              return JSON.parse(Buffer.from(normalized, 'base64').toString('utf8'));
+            };
 
             if (process.env.NPM_TOKEN && process.env.NPM_TOKEN.length > 0) {
               return '';
@@ -306,7 +316,22 @@ jobs:
               return '';
             }
 
-            return await core.getIDToken('https://registry.npmjs.org');
+            const token = await core.getIDToken(audience);
+
+            const parts = String(token || '').split('.');
+            if (parts.length !== 3) {
+              core.error(`Failed to obtain valid OIDC token for npm publishing. Expected JWT segments 3, got ${parts.length}.`);
+              return '';
+            }
+
+            try {
+              const payload = decodeJwtPayload(parts[1]);
+              core.info(`OIDC token claims: aud=${payload.aud || 'missing'}, sub=${payload.sub || 'missing'}, exp=${payload.exp || 'missing'}.`);
+            } catch (error) {
+              core.warning(`Failed to decode OIDC token payload for diagnostics: ${error.message || error}`);
+            }
+
+            return token;
 
       - name: Download NPM packages
         if: steps.publish_config.outputs.enabled == '1'
@@ -319,10 +344,11 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
+          NPM_OIDC_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
         run: |
           NPM_CONFIG_USERCONFIG="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          unset NODE_AUTH_TOKEN
 
           # If NPM_TOKEN is set, use it directly; otherwise use OIDC token.
           NPM_OIDC_PUBLISH_ENABLED=0
@@ -342,17 +368,23 @@ jobs:
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=0
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
-            if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NODE_AUTH_TOKEN is not available."
+            if [ -z "${NPM_OIDC_AUTH_TOKEN:-}" ]; then
+              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NPM_OIDC_AUTH_TOKEN is not available."
               echo "Run with setup-node id-token integration and repository trusted publisher settings for scope ${NPM_PUBLISH_OIDC_SCOPE}."
               exit 1
             fi
+
+            if [ "$(echo "${NPM_OIDC_AUTH_TOKEN}" | tr '.' '\n' | wc -l)" -ne 3 ]; then
+              echo "NPM_OIDC_AUTH_TOKEN is not a valid JWT (expected 3 segments)."
+              exit 1
+            fi
+
             {
               echo "registry=https://registry.npmjs.org/"
               echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
-              echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"
+              echo "//registry.npmjs.org/:_authToken=${NPM_OIDC_AUTH_TOKEN}"
             } > "${NPM_CONFIG_USERCONFIG}"
-            echo "OIDC publish is enabled; using NODE_AUTH_TOKEN from workflow environment."
+            echo "OIDC publish is enabled; using NPM_OIDC_AUTH_TOKEN from resolved OIDC token step."
             echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
@@ -459,12 +491,21 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
+          NPM_PUBLISH_OIDC_AUDIENCE: ${{ env.NPM_PUBLISH_OIDC_AUDIENCE }}
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
             const raw = String(process.env.NPM_OIDC_PUBLISH || '').toLowerCase();
+            const audience = String(process.env.NPM_PUBLISH_OIDC_AUDIENCE || 'https://registry.npmjs.org');
             const oidcEnabled = ['1', 'true', 'yes', 'on'].includes(raw);
+            const decodeJwtPayload = (tokenPart) => {
+              const normalized = tokenPart
+                .replace(/-/g, "+")
+                .replace(/_/g, "/")
+                .padEnd(tokenPart.length + ((4 - (tokenPart.length % 4)) % 4), "=");
+              return JSON.parse(Buffer.from(normalized, 'base64').toString('utf8'));
+            };
 
             if (process.env.NPM_TOKEN && process.env.NPM_TOKEN.length > 0) {
               return '';
@@ -474,7 +515,22 @@ jobs:
               return '';
             }
 
-            return await core.getIDToken('https://registry.npmjs.org');
+            const token = await core.getIDToken(audience);
+
+            const parts = String(token || '').split('.');
+            if (parts.length !== 3) {
+              core.error(`Failed to obtain valid OIDC token for npm publishing. Expected JWT segments 3, got ${parts.length}.`);
+              return '';
+            }
+
+            try {
+              const payload = decodeJwtPayload(parts[1]);
+              core.info(`OIDC token claims: aud=${payload.aud || 'missing'}, sub=${payload.sub || 'missing'}, exp=${payload.exp || 'missing'}.`);
+            } catch (error) {
+              core.warning(`Failed to decode OIDC token payload for diagnostics: ${error.message || error}`);
+            }
+
+            return token;
 
       - name: Download base package
         if: steps.publish_config.outputs.enabled == '1'
@@ -493,10 +549,11 @@ jobs:
         if: steps.publish_config.outputs.enabled == '1'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
+          NPM_OIDC_AUTH_TOKEN: ${{ steps.npm_auth_token.outputs.result }}
           NPM_OIDC_PUBLISH: ${{ vars.NPM_OIDC_PUBLISH }}
         run: |
           NPM_CONFIG_USERCONFIG="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          unset NODE_AUTH_TOKEN
 
           NPM_OIDC_PUBLISH_ENABLED=0
           case "${NPM_OIDC_PUBLISH,,}" in
@@ -522,17 +579,23 @@ jobs:
               exit 1
             fi
           elif [ "$NPM_OIDC_PUBLISH_ENABLED" = "1" ]; then
-            if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NODE_AUTH_TOKEN is not available."
+            if [ -z "${NPM_OIDC_AUTH_TOKEN:-}" ]; then
+              echo "NPM_TOKEN is empty and OIDC publish is enabled, but NPM_OIDC_AUTH_TOKEN is not available."
               echo "Run with setup-node id-token integration and repository trusted publisher settings for scope ${NPM_PUBLISH_OIDC_SCOPE}."
               exit 1
             fi
+
+            if [ "$(echo "${NPM_OIDC_AUTH_TOKEN}" | tr '.' '\n' | wc -l)" -ne 3 ]; then
+              echo "NPM_OIDC_AUTH_TOKEN is not a valid JWT (expected 3 segments)."
+              exit 1
+            fi
+
             {
               echo "registry=https://registry.npmjs.org/"
               echo "${NPM_PUBLISH_OIDC_SCOPE}:registry=https://registry.npmjs.org/"
-              echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"
+              echo "//registry.npmjs.org/:_authToken=${NPM_OIDC_AUTH_TOKEN}"
             } > "${NPM_CONFIG_USERCONFIG}"
-            echo "OIDC publish is enabled; using NODE_AUTH_TOKEN from workflow environment."
+            echo "OIDC publish is enabled; using NPM_OIDC_AUTH_TOKEN from resolved OIDC token step."
             echo "Using GitHub OIDC trusted publishing (npm provenance) for scope ${NPM_PUBLISH_OIDC_SCOPE} + ${NPM_PUBLISH_OIDC_REPO}."
             PUBLISH_ARGS="--access public --provenance"
             USING_OIDC=1
