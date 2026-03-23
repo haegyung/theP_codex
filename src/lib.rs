@@ -18,6 +18,7 @@ mod claude_code_agent;
 mod cli_common;
 mod codex_agent;
 mod gemini_agent;
+mod link_paths;
 mod local_spawner;
 mod multi_backend;
 mod prompt_args;

@@ -4,7 +4,9 @@ use agent_client_protocol::{
 };
 use tracing::error;
 
-use crate::{ACP_CLIENT, resolve_session_alias};
+use crate::{
+    ACP_CLIENT, link_paths::normalize_outgoing_local_markdown_links, resolve_session_alias,
+};
 
 pub fn prompt_blocks_to_text(blocks: &[ContentBlock]) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -50,9 +52,10 @@ pub async fn send_agent_text(session_id: &SessionId, text: impl Into<String>) {
         return;
     };
     let routed_session_id = resolve_session_alias(session_id);
+    let text = normalize_outgoing_local_markdown_links(&text.into());
 
     let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-        TextContent::new(text.into()),
+        TextContent::new(text),
     )));
 
     if let Err(err) = client

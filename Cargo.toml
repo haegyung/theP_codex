@@ -1,6 +1,6 @@
 [package]
 name = "xsfire-camp"
-version = "0.9.19"
+version = "0.9.20"
 edition = "2024"
 authors = ["haegyung <g@theprometheus.xyz>"]
 license = "CC-BY-NC-SA-4.0"
@@ -8,13 +8,13 @@ description = "ACP IDE bridge for Codex CLI with structured tool/plan/approval s
 repository = "https://github.com/theprometheusxyz/xsfire-camp"
 homepage = "https://github.com/theprometheusxyz/xsfire-camp"
 
-[[bin]]
-name = "xsfire-camp"
-path = "src/main.rs"
-
 [lib]
 name = "xsfire_camp"
 path = "src/lib.rs"
+
+[[bin]]
+name = "xsfire-camp"
+path = "src/main.rs"
 
 [dependencies]
 agent-client-protocol = { version = "=0.9.3", features = ["unstable"] }
@@ -23,27 +23,36 @@ async-trait = "0.1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-arg0 = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["cli"] }
+codex-common = { git = "https://github.com/zed-industries/codex", branch = "acp", features = [
+  "cli"
+] }
 codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-mcp-server = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 codex-protocol = { git = "https://github.com/zed-industries/codex", branch = "acp" }
-codex-login = { git = "https://github.com/zed-industries/codex", branch = "acp" }
+heck = "0.5.0"
 itertools = "0.14.0"
 mcp-types = { git = "https://github.com/zed-industries/codex", branch = "acp" }
 regex-lite = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { version = "1", features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt-multi-thread"
+] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-heck = "0.5.0"
 unicode-segmentation = "1.11.0"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", features = ["test-support"] }
+codex-core = { git = "https://github.com/zed-industries/codex", branch = "acp", features = [
+  "test-support"
+] }
 
 [lints.rust]
 let-underscore = "warn"

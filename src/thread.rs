@@ -80,6 +80,7 @@ use uuid::Uuid;
 
 use crate::{
     ACP_CLIENT, current_client_info,
+    link_paths::normalize_outgoing_local_markdown_links,
     prompt_args::{expand_custom_prompt, parse_slash_name},
     session_store::SessionStore,
 };
@@ -3194,7 +3195,7 @@ impl SessionClient {
     }
 
     async fn send_agent_text(&self, text: impl Into<String>) {
-        let text = text.into();
+        let text = normalize_outgoing_local_markdown_links(&text.into());
         let max_chars = ui_text_chunk_max_chars_from_env();
         for chunk in split_text_for_ui_chunks(&text, max_chars) {
             self.diagnostics
@@ -9295,6 +9296,37 @@ mod tests {
             text_chunks,
             vec!["a".repeat(512), "b".repeat(512), "c".to_string()],
             "expected ACP_UI_TEXT_CHUNK_MAX_CHARS to chunk outgoing agent text. notifications={notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_send_agent_text_normalizes_local_markdown_file_links() -> anyhow::Result<()> {
+        let session_id = SessionId::new("local-link-normalization-test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), Arc::default(), None);
+
+        session_client
+            .send_agent_text("[open](/Volumes/Extend/Projects/Writer/_open/test.md)")
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let text_chunks = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text_chunks,
+            vec!["[open](file:///Volumes/Extend/Projects/Writer/_open/test.md)".to_string()],
+            "expected outgoing ACP agent text to normalize bare local markdown links. notifications={notifications:?}"
         );
 
         Ok(())
