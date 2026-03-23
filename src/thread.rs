@@ -3064,6 +3064,61 @@ impl SessionClient {
         self.ui_visibility_mode.hides_internal_updates()
     }
 
+    fn is_zed_client(&self) -> bool {
+        current_client_info()
+            .as_deref()
+            .is_some_and(|info| info.to_ascii_lowercase().contains("zed"))
+    }
+
+    fn plan_status_counts(plan: &[PlanItemArg]) -> (usize, usize, usize, usize) {
+        let pending = plan
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Pending))
+            .count();
+        let in_progress = plan
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::InProgress))
+            .count();
+        let completed = plan
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Completed))
+            .count();
+        (completed, in_progress, pending, plan.len())
+    }
+
+    fn zed_plan_progress_entry(&self, plan: &[PlanItemArg]) -> Option<PlanEntry> {
+        if !self.is_zed_client() || plan.is_empty() {
+            return None;
+        }
+
+        let (completed, in_progress, pending, total) = Self::plan_status_counts(plan);
+        let percent = if total == 0 {
+            0
+        } else {
+            completed.saturating_mul(100) / total
+        };
+        let progress_bar = FlowVectorState::render_progress_bar(
+            completed,
+            total,
+            monitor_progress_bar_width(monitor_panel_width()),
+        );
+        let status = if completed == total {
+            PlanEntryStatus::Completed
+        } else if completed > 0 || in_progress > 0 {
+            PlanEntryStatus::InProgress
+        } else {
+            PlanEntryStatus::Pending
+        };
+
+        Some(PlanEntry::new(
+            format!(
+                "Progress: {progress_bar} {percent}% ({completed}/{total} completed, {in_progress} in_progress, {pending} pending)"
+            ),
+            PlanEntryPriority::Medium,
+            status,
+        ))
+    }
+
     fn runtime_diagnostics_snapshot(
         &self,
         reason: impl Into<String>,
@@ -3324,22 +3379,25 @@ impl SessionClient {
         if self.hides_internal_updates() {
             return;
         }
-        self.send_notification(SessionUpdate::Plan(Plan::new(
-            plan.into_iter()
-                .map(|entry| {
-                    PlanEntry::new(
-                        entry.step,
-                        PlanEntryPriority::Medium,
-                        match entry.status {
-                            StepStatus::Pending => PlanEntryStatus::Pending,
-                            StepStatus::InProgress => PlanEntryStatus::InProgress,
-                            StepStatus::Completed => PlanEntryStatus::Completed,
-                        },
-                    )
-                })
-                .collect(),
-        )))
-        .await;
+
+        let mut entries = Vec::new();
+        if let Some(summary) = self.zed_plan_progress_entry(&plan) {
+            entries.push(summary);
+        }
+        entries.extend(plan.into_iter().map(|entry| {
+            PlanEntry::new(
+                entry.step,
+                PlanEntryPriority::Medium,
+                match entry.status {
+                    StepStatus::Pending => PlanEntryStatus::Pending,
+                    StepStatus::InProgress => PlanEntryStatus::InProgress,
+                    StepStatus::Completed => PlanEntryStatus::Completed,
+                },
+            )
+        }));
+
+        self.send_notification(SessionUpdate::Plan(Plan::new(entries)))
+            .await;
     }
 
     async fn request_permission(
@@ -8050,6 +8108,143 @@ mod tests {
         assert!(ops.is_empty(), "setup command should not submit backend op");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_setup_emits_zed_plan_progress_summary() -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        crate::record_client_info(Some("zed@plan-progress-test".to_string()));
+        let result = async {
+            let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec!["/setup".into()]),
+                response_tx: prompt_response_tx,
+            })?;
+
+            tokio::try_join!(
+                async {
+                    let stop_reason = prompt_response_rx.await??.await??;
+                    assert_eq!(stop_reason, StopReason::EndTurn);
+                    drop(message_tx);
+                    anyhow::Ok(())
+                },
+                async {
+                    local_set.await;
+                    anyhow::Ok(())
+                }
+            )?;
+
+            let notifications = client.notifications.lock().unwrap();
+            let plan = notifications.iter().find_map(|n| match &n.update {
+                SessionUpdate::Plan(plan) => Some(plan),
+                _ => None,
+            });
+            let Some(plan) = plan else {
+                panic!(
+                    "expected /setup to emit SessionUpdate::Plan. notifications={notifications:?}"
+                );
+            };
+
+            let summary = plan
+                .entries
+                .first()
+                .expect("expected progress summary entry");
+            assert!(
+                summary.content.starts_with("Progress: ["),
+                "expected zed progress summary first. plan={plan:?}"
+            );
+            assert!(
+                summary.content.contains('%'),
+                "expected progress summary to include percent. plan={plan:?}"
+            );
+            assert!(
+                plan.entries
+                    .iter()
+                    .any(|entry| entry.content == "Setup: authentication"),
+                "expected original setup step to remain. plan={plan:?}"
+            );
+
+            let ops = thread.ops.lock().unwrap();
+            assert!(ops.is_empty(), "setup command should not submit backend op");
+
+            Ok(())
+        }
+        .await;
+        crate::record_client_info(None);
+        result
+    }
+
+    #[tokio::test]
+    async fn test_setup_does_not_emit_plan_progress_summary_for_non_zed_client()
+    -> anyhow::Result<()> {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        crate::record_client_info(Some("other-client@plan-progress-test".to_string()));
+        let result = async {
+            let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
+            let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+            message_tx.send(ThreadMessage::Prompt {
+                request: PromptRequest::new(session_id.clone(), vec!["/setup".into()]),
+                response_tx: prompt_response_tx,
+            })?;
+
+            tokio::try_join!(
+                async {
+                    let stop_reason = prompt_response_rx.await??.await??;
+                    assert_eq!(stop_reason, StopReason::EndTurn);
+                    drop(message_tx);
+                    anyhow::Ok(())
+                },
+                async {
+                    local_set.await;
+                    anyhow::Ok(())
+                }
+            )?;
+
+            let notifications = client.notifications.lock().unwrap();
+            let plan = notifications.iter().find_map(|n| match &n.update {
+                SessionUpdate::Plan(plan) => Some(plan),
+                _ => None,
+            });
+            let Some(plan) = plan else {
+                panic!(
+                    "expected /setup to emit SessionUpdate::Plan. notifications={notifications:?}"
+                );
+            };
+
+            let first_entry = plan
+                .entries
+                .first()
+                .expect("expected setup plan to have entries");
+            assert_eq!(
+                first_entry.content, "Protocol: Goal -> Rubric(Must/Should+Evidence) locked",
+                "expected non-zed clients to keep the first setup step unchanged. plan={plan:?}"
+            );
+            assert!(
+                plan.entries
+                    .iter()
+                    .all(|entry| !entry.content.starts_with("Progress: [")),
+                "expected non-zed clients to omit progress summary row. plan={plan:?}"
+            );
+
+            let ops = thread.ops.lock().unwrap();
+            assert!(ops.is_empty(), "setup command should not submit backend op");
+
+            Ok(())
+        }
+        .await;
+        crate::record_client_info(None);
+        result
     }
 
     #[tokio::test]
