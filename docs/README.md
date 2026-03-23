@@ -15,6 +15,7 @@
 - [release_plan_v0.9.4.md](plans/release_plan_v0.9.4.md): 릴리즈 실행 계획
 
 ## releases/
+- [release_notes_v0.9.23.md](releases/release_notes_v0.9.23.md)
 - [release_notes_v0.9.22.md](releases/release_notes_v0.9.22.md)
 - [release_notes_v0.9.21.md](releases/release_notes_v0.9.21.md)
 - [release_notes_v0.9.20.md](releases/release_notes_v0.9.20.md)
