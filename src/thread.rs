@@ -120,6 +120,12 @@ const DIAGNOSTICS_LOG_EVERY_ENV: &str = "ACP_DIAGNOSTICS_LOG_EVERY";
 const DIAGNOSTICS_LOG_EVERY_DEFAULT: u64 = 50;
 const DIAGNOSTICS_LOG_EVERY_MIN: u64 = 5;
 const DIAGNOSTICS_LOG_EVERY_MAX: u64 = 5_000;
+const MONITOR_BOTTLENECK_SLOW_SECS: u64 = 20;
+const MONITOR_REPEAT_STREAK_WARN: usize = 3;
+const MONITOR_PHASE_DOMINANCE_MIN_EVENTS: usize = 8;
+const MONITOR_PHASE_DOMINANCE_WARN_PERCENT: usize = 75;
+const MONITOR_STALL_PLAN_UPDATE_WARN: usize = 2;
+const MONITOR_STALL_NO_PROGRESS_WARN_SECS: u64 = 45;
 
 #[derive(Clone, Debug)]
 struct SessionListEntry {
@@ -748,6 +754,11 @@ struct FlowVectorState {
     path: Vec<char>,
     recent_actions: VecDeque<String>,
     last_plan: PlanSnapshot,
+    last_plan_update_at: Option<Instant>,
+    last_progress_at: Option<Instant>,
+    stalled_plan_updates: usize,
+    last_completed_steps: usize,
+    last_plan_total_steps: usize,
 }
 
 impl FlowVectorState {
@@ -811,6 +822,26 @@ impl FlowVectorState {
     }
 
     fn record_plan_update(&mut self, explanation: Option<String>, plan: &[PlanItemArg]) {
+        let now = Instant::now();
+        let completed = plan
+            .iter()
+            .filter(|item| matches!(item.status, StepStatus::Completed))
+            .count();
+        let total = plan.len();
+
+        if self.last_plan_update_at.is_none()
+            || completed != self.last_completed_steps
+            || total != self.last_plan_total_steps
+        {
+            self.stalled_plan_updates = 0;
+            self.last_progress_at = Some(now);
+        } else {
+            self.stalled_plan_updates = self.stalled_plan_updates.saturating_add(1);
+        }
+        self.last_completed_steps = completed;
+        self.last_plan_total_steps = total;
+        self.last_plan_update_at = Some(now);
+
         self.last_plan = PlanSnapshot {
             explanation,
             items: plan
@@ -822,6 +853,122 @@ impl FlowVectorState {
                 .collect(),
         };
         self.record_phase('C', "plan updated");
+    }
+
+    fn trailing_action_streak(&self) -> Option<(String, usize)> {
+        let mut actions = self.recent_actions.iter().rev();
+        let latest = actions.next()?.trim().to_string();
+        if latest.is_empty() {
+            return None;
+        }
+
+        let mut streak = 1;
+        for action in actions {
+            if action.trim() == latest {
+                streak += 1;
+            } else {
+                break;
+            }
+        }
+        Some((latest, streak))
+    }
+
+    fn dominant_recent_phase(&self, max_events: usize) -> Option<(char, usize, usize)> {
+        let mut analysis = 0;
+        let mut execution = 0;
+        let mut validation = 0;
+        let mut coordination = 0;
+        let recent = self
+            .path
+            .iter()
+            .rev()
+            .take(max_events)
+            .copied()
+            .collect::<Vec<_>>();
+        if recent.is_empty() {
+            return None;
+        }
+
+        for phase in &recent {
+            match phase {
+                'A' => analysis += 1,
+                'E' => execution += 1,
+                'V' => validation += 1,
+                'C' => coordination += 1,
+                _ => {}
+            }
+        }
+
+        let mut dominant = ('A', analysis);
+        for (phase, count) in [('E', execution), ('V', validation), ('C', coordination)] {
+            if count > dominant.1 {
+                dominant = (phase, count);
+            }
+        }
+        Some((dominant.0, dominant.1, recent.len()))
+    }
+
+    fn render_repeat_signal(&self) -> String {
+        if let Some((latest_action, streak)) = self.trailing_action_streak()
+            && streak >= MONITOR_REPEAT_STREAK_WARN
+        {
+            return format!("Repeat loop: `{latest_action}` repeated {streak}x in a row");
+        }
+
+        if let Some((phase, hits, total)) = self.dominant_recent_phase(12)
+            && total >= MONITOR_PHASE_DOMINANCE_MIN_EVENTS
+        {
+            let dominant_percent = hits.saturating_mul(100) / total;
+            if dominant_percent >= MONITOR_PHASE_DOMINANCE_WARN_PERCENT {
+                return format!(
+                    "Repeat loop: recent flow is {}-heavy ({hits}/{total}, {dominant_percent}%)",
+                    flow_phase_name(phase)
+                );
+            }
+        }
+
+        "Repeat loop: no strong repetition signal".to_string()
+    }
+
+    fn render_stall_signal(&self, active_task_count: usize) -> String {
+        let Some(last_plan_update_at) = self.last_plan_update_at else {
+            return "Progress stall: no plan updates yet".to_string();
+        };
+
+        let no_progress_age = self
+            .last_progress_at
+            .map(|moment| moment.elapsed())
+            .unwrap_or_default();
+        let plan_update_age = last_plan_update_at.elapsed();
+
+        if active_task_count > 0 && self.stalled_plan_updates >= MONITOR_STALL_PLAN_UPDATE_WARN {
+            return format!(
+                "Progress stall: {} consecutive plan updates without completed-step gain (last completion {} ago)",
+                self.stalled_plan_updates,
+                format_monitor_duration(no_progress_age)
+            );
+        }
+
+        if active_task_count > 0 && no_progress_age.as_secs() >= MONITOR_STALL_NO_PROGRESS_WARN_SECS
+        {
+            return format!(
+                "Progress stall: no completed step for {} while {} task(s) are active",
+                format_monitor_duration(no_progress_age),
+                active_task_count
+            );
+        }
+
+        if active_task_count == 0 {
+            return format!(
+                "Progress stall: idle (last plan update {} ago)",
+                format_monitor_duration(plan_update_age)
+            );
+        }
+
+        format!(
+            "Progress stall: healthy (last completed-step change {} ago)",
+            format_monitor_duration(no_progress_age)
+        )
     }
 
     fn path_string(&self) -> String {
@@ -957,6 +1104,44 @@ fn flow_semantic_from_direction(direction: &str) -> &'static str {
         "W" => "coordination-heavy: planning, scoping, and alignment",
         "NW" => "coordination + analysis: strategy and architecture shaping",
         _ => "neutral: balanced or insufficient signal",
+    }
+}
+
+fn flow_phase_name(phase: char) -> &'static str {
+    match phase {
+        'A' => "analysis",
+        'E' => "execution",
+        'V' => "validation",
+        'C' => "coordination",
+        _ => "unknown",
+    }
+}
+
+fn format_monitor_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 1 {
+        return "<1s".to_string();
+    }
+
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if mins < 60 {
+        if rem_secs == 0 {
+            return format!("{mins}m");
+        }
+        return format!("{mins}m {rem_secs}s");
+    }
+
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if rem_mins == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {rem_mins}m")
     }
 }
 
@@ -1384,6 +1569,14 @@ impl SubmissionState {
             }),
         }
     }
+
+    fn longest_open_tool_call_runtime(&self) -> Option<OpenToolCallRuntime> {
+        match self {
+            Self::Prompt(state) => state.longest_open_tool_call_runtime(),
+            Self::Task(state) => state.longest_open_tool_call_runtime(),
+            Self::CustomPrompts(_) | Self::OneShot(_) => None,
+        }
+    }
 }
 
 struct CustomPromptsState {
@@ -1520,6 +1713,12 @@ struct OpenToolCall {
     started_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct OpenToolCallRuntime {
+    kind: &'static str,
+    elapsed: Duration,
+}
+
 struct PromptState {
     active_command: Option<ActiveCommand>,
     active_web_search: Option<String>,
@@ -1651,6 +1850,16 @@ impl PromptState {
             return false;
         }
         self.response_tx.as_ref().is_none_or(|tx| !tx.is_closed())
+    }
+
+    fn longest_open_tool_call_runtime(&self) -> Option<OpenToolCallRuntime> {
+        self.open_tool_calls
+            .values()
+            .map(|open_call| OpenToolCallRuntime {
+                kind: open_call.kind,
+                elapsed: open_call.started_at.elapsed(),
+            })
+            .max_by_key(|runtime| runtime.elapsed)
     }
 
     fn finish_with_result(&mut self, result: Result<StopReason, Error>) {
@@ -2988,6 +3197,10 @@ impl TaskState {
 
     fn is_active(&self) -> bool {
         self.prompt.is_active()
+    }
+
+    fn longest_open_tool_call_runtime(&self) -> Option<OpenToolCallRuntime> {
+        self.prompt.longest_open_tool_call_runtime()
     }
 
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
@@ -4869,6 +5082,53 @@ impl<A: Auth> ThreadActor<A> {
         lines.join("\n")
     }
 
+    fn render_progress_signals_snapshot(&self, active_task_count: usize) -> String {
+        let mut lines = Vec::new();
+        lines.push("Progress signals".to_string());
+
+        let bottleneck = self
+            .submissions
+            .iter()
+            .filter_map(|(submission_id, state)| {
+                let label = state.monitor_label()?;
+                if !state.is_active() {
+                    return None;
+                }
+                state
+                    .longest_open_tool_call_runtime()
+                    .map(|runtime| (submission_id, label, runtime))
+            })
+            .max_by_key(|(_, _, runtime)| runtime.elapsed);
+
+        let bottleneck_line = match bottleneck {
+            Some((submission_id, label, runtime))
+                if runtime.elapsed.as_secs() >= MONITOR_BOTTLENECK_SLOW_SECS =>
+            {
+                format!(
+                    "Bottleneck: `{}` in {label}:{submission_id} has been running for {}",
+                    runtime.kind,
+                    format_monitor_duration(runtime.elapsed)
+                )
+            }
+            Some((submission_id, label, runtime)) => {
+                format!(
+                    "Bottleneck: longest open tool call is `{}` in {label}:{submission_id} ({} elapsed)",
+                    runtime.kind,
+                    format_monitor_duration(runtime.elapsed)
+                )
+            }
+            None if active_task_count > 0 => {
+                "Bottleneck: active tasks exist, but no open tool calls are currently running"
+                    .to_string()
+            }
+            None => "Bottleneck: no active bottleneck signal".to_string(),
+        };
+        lines.push(bottleneck_line);
+        lines.push(self.flow_vector.render_repeat_signal());
+        lines.push(self.flow_vector.render_stall_signal(active_task_count));
+        lines.join("\n")
+    }
+
     fn render_monitor_retrospective(&self) -> String {
         let progress_bar = |latest_percent: u8| -> String {
             let width: usize = 10;
@@ -4979,6 +5239,11 @@ impl<A: Auth> ThreadActor<A> {
         lines.push(String::new());
         lines.extend(monitor_fit_block(
             &self.render_task_monitoring_snapshot(),
+            panel_width,
+        ));
+        lines.push(String::new());
+        lines.extend(monitor_fit_block(
+            &self.render_progress_signals_snapshot(active_task_count),
             panel_width,
         ));
         lines.push(String::new());
@@ -7374,6 +7639,26 @@ mod tests {
             )),
             "monitor output should include task monitoring defaults. notifications={notifications:?}"
         );
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Progress signals")),
+            "monitor output should include progress signals panel. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks.iter().any(|text| text.contains("Bottleneck:")),
+            "monitor output should include bottleneck signal. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks.iter().any(|text| text.contains("Repeat loop:")),
+            "monitor output should include repeat-loop signal. notifications={notifications:?}"
+        );
+        assert!(
+            text_chunks
+                .iter()
+                .any(|text| text.contains("Progress stall:")),
+            "monitor output should include stall signal. notifications={notifications:?}"
+        );
 
         let ops = thread.ops.lock().unwrap();
         assert!(
@@ -7830,6 +8115,88 @@ mod tests {
         assert!(
             snapshot.contains("[in_progress] task: submission-1"),
             "active task monitoring entry should include label and id. snapshot={snapshot}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flow_vector_repeat_and_stall_signals_show_stagnation() {
+        let mut flow = FlowVectorState::default();
+        for _ in 0..MONITOR_REPEAT_STREAK_WARN {
+            flow.record_phase('E', "exec begin: cargo test");
+        }
+
+        let now = Instant::now();
+        flow.last_plan_update_at = Some(now.checked_sub(Duration::from_secs(90)).unwrap_or(now));
+        flow.last_progress_at = Some(now.checked_sub(Duration::from_secs(90)).unwrap_or(now));
+        flow.stalled_plan_updates = MONITOR_STALL_PLAN_UPDATE_WARN;
+
+        let repeat_signal = flow.render_repeat_signal();
+        assert!(
+            repeat_signal.contains("repeated"),
+            "repeat signal should flag same-action streaks. signal={repeat_signal}"
+        );
+
+        let stall_signal = flow.render_stall_signal(1);
+        assert!(
+            stall_signal.contains("consecutive plan updates"),
+            "stall signal should flag repeated plan updates without progress. signal={stall_signal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progress_signals_snapshot_reports_long_running_open_tool_call()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("test-progress-signals-bottleneck");
+        let client = Arc::new(StubClient::new());
+        let thread = Arc::new(StubCodexThread::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client, Arc::default(), None);
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            thread,
+            models_manager,
+            config,
+            message_rx,
+        );
+
+        let mut prompt = PromptState::new_background(actor.thread.clone(), "submission-1".into());
+        let started_at = Instant::now()
+            .checked_sub(Duration::from_secs(MONITOR_BOTTLENECK_SLOW_SECS + 5))
+            .unwrap_or_else(Instant::now);
+        prompt.open_tool_calls.insert(
+            "exec-call-1".to_string(),
+            OpenToolCall {
+                kind: "exec",
+                started_at,
+            },
+        );
+        actor
+            .submissions
+            .insert("submission-1".to_string(), SubmissionState::Prompt(prompt));
+
+        let snapshot = actor.render_progress_signals_snapshot(1);
+        assert!(
+            snapshot.contains("Bottleneck: `exec`"),
+            "progress signals should include bottleneck tool kind. snapshot={snapshot}"
+        );
+        assert!(
+            snapshot.contains("submission-1"),
+            "progress signals should include submission id for bottleneck attribution. snapshot={snapshot}"
+        );
+        assert!(
+            snapshot.contains("running for"),
+            "progress signals should include bottleneck runtime duration. snapshot={snapshot}"
         );
 
         Ok(())
