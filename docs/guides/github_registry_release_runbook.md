@@ -18,23 +18,30 @@ Purpose: provide one canonical operational flow for GitHub release checks, ACP r
 4. Record outcome in release notes/checklists.
 
 ## Current State Snapshot
-- Latest product release target is `v0.9.18`.
-- `xsfire-camp` is distributed through GitHub release binaries and the ACP registry binary entry.
-- ACP registry PR `#93` is content-updated to `v0.9.18` and is currently blocked by upstream maintainer approval/re-run (`action_required`).
+- Snapshot time (UTC): `2026-03-24T02:26:27Z`.
+- Latest product release target is `v0.9.23`.
+- `v0.9.23` GitHub release is published (`draft=false`, `prerelease=false`):
+  - `https://github.com/theprometheusxyz/xsfire-camp/releases/tag/v0.9.23`
+- Latest product `Release` workflow run is `23447088552` on branch `v0.9.23` with `conclusion=success`:
+  - `https://github.com/theprometheusxyz/xsfire-camp/actions/runs/23447088552`
+- ACP registry PR `#93` is `OPEN` with `mergeStateStatus=BLOCKED`:
+  - `https://github.com/agentclientprotocol/registry/pull/93`
+- Latest ACP `Build Registry` run on branch `add-xsfire-camp-agent` is `23401346990` with `conclusion=action_required`, and `gh pr checks` reports no checks:
+  - `https://github.com/agentclientprotocol/registry/actions/runs/23401346990`
 
 ## Verification Commands
 ```bash
 # 1) Latest release and release workflow in product repo
-gh release view v0.9.18 --repo theprometheusxyz/xsfire-camp
-gh run list --repo theprometheusxyz/xsfire-camp --workflow release.yml --limit 5
+gh release view v0.9.23 --repo theprometheusxyz/xsfire-camp --json name,tagName,isDraft,isPrerelease,url,publishedAt
+gh run list --repo theprometheusxyz/xsfire-camp --workflow release.yml --limit 5 --json databaseId,workflowName,headBranch,status,conclusion,url,createdAt
 
 # 2) ACP registry PR status/checks (replace PR number if needed)
-gh pr view 93 --repo agentclientprotocol/registry --json number,state,mergeStateStatus,headRefName,baseRefName,url
+gh pr view 93 --repo agentclientprotocol/registry --json number,state,mergeStateStatus,headRefName,baseRefName,url,updatedAt
 gh pr checks 93 --repo agentclientprotocol/registry
 
 # 3) If a specific registry workflow run is blocked/action_required
-gh run list --repo agentclientprotocol/registry --branch add-xsfire-camp-agent --limit 5
-gh run view 23106246048 --repo agentclientprotocol/registry
+gh run list --repo agentclientprotocol/registry --branch add-xsfire-camp-agent --limit 5 --json databaseId,workflowName,status,conclusion,url,createdAt
+gh run view 23401346990 --repo agentclientprotocol/registry
 ```
 
 ## Blocker Handling
