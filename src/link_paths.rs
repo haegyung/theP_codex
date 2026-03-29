@@ -6,14 +6,34 @@ fn looks_like_windows_absolute_path(dest: &str) -> bool {
         && matches!(bytes[2], b'/' | b'\\')
 }
 
+fn split_uri_suffix(dest: &str) -> (&str, &str) {
+    let query_index = dest.find('?');
+    let fragment_index = dest.find('#');
+    let split_index = match (query_index, fragment_index) {
+        (Some(query), Some(fragment)) => query.min(fragment),
+        (Some(query), None) => query,
+        (None, Some(fragment)) => fragment,
+        (None, None) => dest.len(),
+    };
+
+    (&dest[..split_index], &dest[split_index..])
+}
+
 fn normalize_bare_local_path_to_file_uri(dest: &str) -> Option<String> {
-    if dest.starts_with('/') && !dest.starts_with("//") {
-        Some(format!("file://{}", percent_encode_file_path(dest)))
-    } else if looks_like_windows_absolute_path(dest) {
-        let normalized = dest.replace('\\', "/");
+    let (path, suffix) = split_uri_suffix(dest);
+
+    if path.starts_with('/') && !path.starts_with("//") {
         Some(format!(
-            "file://{}",
-            percent_encode_file_path(&format!("/{normalized}"))
+            "file://{}{}",
+            percent_encode_file_path(path),
+            suffix
+        ))
+    } else if looks_like_windows_absolute_path(path) {
+        let normalized = path.replace('\\', "/");
+        Some(format!(
+            "file://{}{}",
+            percent_encode_file_path(&format!("/{normalized}")),
+            suffix
         ))
     } else {
         None
@@ -161,6 +181,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_line_fragments_when_normalizing_local_file_links() {
+        let input =
+            "[code](/Volumes/Extend/Projects/DevWorkspace/xsfire-camp/src/codex_agent.rs#L257)";
+        let output = normalize_outgoing_local_markdown_links(input);
+        assert_eq!(
+            output,
+            "[code](file:///Volumes/Extend/Projects/DevWorkspace/xsfire-camp/src/codex_agent.rs#L257)"
+        );
+    }
+
+    #[test]
     fn preserves_existing_uris_and_plain_text() {
         let input = concat!(
             "[web](https://example.com)\n",
@@ -178,6 +209,16 @@ mod tests {
         assert_eq!(
             output,
             "[win](<file:///C:/Users/g/Documents/report%20final.md>)"
+        );
+    }
+
+    #[test]
+    fn preserves_fragments_for_windows_absolute_paths() {
+        let input = "[win](<C:\\Users\\g\\Documents\\report final.md#L12>)";
+        let output = normalize_outgoing_local_markdown_links(input);
+        assert_eq!(
+            output,
+            "[win](<file:///C:/Users/g/Documents/report%20final.md#L12>)"
         );
     }
 }

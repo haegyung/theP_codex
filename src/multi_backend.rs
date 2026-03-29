@@ -1,12 +1,17 @@
 use agent_client_protocol::{
     AuthMethod, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionConfigOption,
+    ForkSessionRequest, ForkSessionResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -30,6 +35,9 @@ pub struct MultiBackendDriver {
     gemini: Rc<dyn BackendDriver>,
     sessions: RefCell<HashMap<SessionId, RoutedSession>>,
 }
+
+const MULTI_CODEX_CURSOR_PREFIX: &str = "multi:codex:";
+const MULTI_ROUTED_CURSOR: &str = "multi:routed";
 
 impl MultiBackendDriver {
     pub fn new(
@@ -173,6 +181,89 @@ impl MultiBackendDriver {
         };
         Ok((backend, self.driver_for(backend), child))
     }
+
+    fn is_synthetic_routed_session_id(session_id: &SessionId) -> bool {
+        session_id.0.as_ref().starts_with("multi:")
+    }
+
+    fn wrap_codex_cursor(cursor: String) -> String {
+        format!("{MULTI_CODEX_CURSOR_PREFIX}{cursor}")
+    }
+
+    fn unwrap_codex_cursor(cursor: &str) -> Option<String> {
+        cursor
+            .strip_prefix(MULTI_CODEX_CURSOR_PREFIX)
+            .map(str::to_string)
+    }
+
+    fn listable_routed_sessions(&self, cwd: Option<&std::path::PathBuf>) -> Vec<SessionInfo> {
+        self.sessions
+            .borrow()
+            .iter()
+            .filter(|(id, session)| {
+                Self::is_synthetic_routed_session_id(id)
+                    && cwd.map(|cwd| session.cwd == *cwd).unwrap_or(true)
+            })
+            .map(|(id, session)| {
+                SessionInfo::new(id.clone(), session.cwd.clone()).title(format!(
+                    "Unified session [{}]",
+                    session.active_backend.as_str()
+                ))
+            })
+            .collect()
+    }
+
+    fn register_routed_session(
+        &self,
+        session_id: SessionId,
+        active_backend: BackendKind,
+        child_session_id: SessionId,
+        child_config_options: Vec<SessionConfigOption>,
+        cwd: std::path::PathBuf,
+        mcp_servers: Vec<agent_client_protocol::McpServer>,
+        meta: Option<agent_client_protocol::Meta>,
+    ) {
+        let mut backend_sessions = HashMap::new();
+        backend_sessions.insert(active_backend, child_session_id.clone());
+        let mut backend_config_options = HashMap::new();
+        backend_config_options.insert(active_backend, child_config_options);
+        self.sessions.borrow_mut().insert(
+            session_id.clone(),
+            RoutedSession {
+                active_backend,
+                backend_sessions,
+                backend_config_options,
+                cwd,
+                mcp_servers,
+                meta,
+            },
+        );
+        register_session_alias(&child_session_id, &session_id);
+    }
+
+    fn codex_backing_session_for(
+        &self,
+        session_id: &SessionId,
+        operation: &str,
+    ) -> Result<SessionId, Error> {
+        let sessions = self.sessions.borrow();
+        if let Some(route) = sessions.get(session_id) {
+            if route.active_backend != BackendKind::Codex {
+                return Err(Error::invalid_params().data(format!(
+                    "multi session/{operation} is only supported for codex-backed routed sessions"
+                )));
+            }
+            return route
+                .backend_sessions
+                .get(&BackendKind::Codex)
+                .cloned()
+                .ok_or_else(|| Error::resource_not_found(None));
+        }
+        if Self::is_synthetic_routed_session_id(session_id) {
+            return Err(Error::resource_not_found(None));
+        }
+        Ok(session_id.clone())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -183,6 +274,14 @@ impl BackendDriver for MultiBackendDriver {
 
     fn supports_load_session(&self) -> bool {
         true
+    }
+
+    fn supports_fork_session(&self) -> bool {
+        self.codex.supports_fork_session()
+    }
+
+    fn supports_resume_session(&self) -> bool {
+        self.codex.supports_resume_session()
     }
 
     fn auth_methods(&self) -> Vec<AuthMethod> {
@@ -220,26 +319,18 @@ impl BackendDriver for MultiBackendDriver {
             .new_session(request.clone())
             .await?;
         let child_session_id = child_response.session_id.clone();
-
         let routed_session_id = SessionId::new(format!("multi:{}", Uuid::new_v4()));
-        let mut backend_sessions = HashMap::new();
-        backend_sessions.insert(backend, child_session_id.clone());
         let child_backend_options = child_response.config_options.clone().unwrap_or_default();
-        let mut backend_config_options = HashMap::new();
-        backend_config_options.insert(backend, child_backend_options.clone());
 
-        self.sessions.borrow_mut().insert(
+        self.register_routed_session(
             routed_session_id.clone(),
-            RoutedSession {
-                active_backend: backend,
-                backend_sessions,
-                backend_config_options,
-                cwd: request.cwd,
-                mcp_servers: request.mcp_servers,
-                meta: request.meta,
-            },
+            backend,
+            child_session_id,
+            child_backend_options.clone(),
+            request.cwd,
+            request.mcp_servers,
+            request.meta,
         );
-        register_session_alias(&child_session_id, &routed_session_id);
 
         let mut response = NewSessionResponse::new(routed_session_id);
         response.modes = child_response.modes;
@@ -254,23 +345,14 @@ impl BackendDriver for MultiBackendDriver {
         request: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, Error> {
         let mut response = self.codex.load_session(request.clone()).await?;
-        let mut backend_sessions = HashMap::new();
-        backend_sessions.insert(BackendKind::Codex, request.session_id.clone());
-        let mut backend_config_options = HashMap::new();
-        backend_config_options.insert(
-            BackendKind::Codex,
-            response.config_options.clone().unwrap_or_default(),
-        );
-        self.sessions.borrow_mut().insert(
+        self.register_routed_session(
             request.session_id.clone(),
-            RoutedSession {
-                active_backend: BackendKind::Codex,
-                backend_sessions,
-                backend_config_options,
-                cwd: request.cwd,
-                mcp_servers: request.mcp_servers,
-                meta: request.meta,
-            },
+            BackendKind::Codex,
+            request.session_id.clone(),
+            response.config_options.clone().unwrap_or_default(),
+            request.cwd,
+            request.mcp_servers,
+            request.meta,
         );
         response.config_options = Some(Self::with_backend_option(
             response.config_options,
@@ -279,20 +361,133 @@ impl BackendDriver for MultiBackendDriver {
         Ok(response)
     }
 
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        let source_session_id = self.codex_backing_session_for(&request.session_id, "fork")?;
+        let ForkSessionRequest {
+            cwd,
+            mcp_servers,
+            meta,
+            ..
+        } = request.clone();
+        let child_response = self
+            .codex
+            .fork_session(
+                ForkSessionRequest::new(source_session_id, cwd.clone())
+                    .mcp_servers(mcp_servers.clone())
+                    .meta(meta.clone()),
+            )
+            .await?;
+
+        let routed_session_id = SessionId::new(format!("multi:{}", Uuid::new_v4()));
+        let child_session_id = child_response.session_id.clone();
+        let child_backend_options = child_response.config_options.clone().unwrap_or_default();
+        self.register_routed_session(
+            routed_session_id.clone(),
+            BackendKind::Codex,
+            child_session_id,
+            child_backend_options.clone(),
+            cwd,
+            mcp_servers,
+            meta,
+        );
+
+        Ok(ForkSessionResponse::new(routed_session_id)
+            .modes(child_response.modes)
+            .models(child_response.models)
+            .config_options(Some(Self::merge_active_options(
+                BackendKind::Codex,
+                child_backend_options,
+            )))
+            .meta(child_response.meta))
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        let child_session_id = self.codex_backing_session_for(&request.session_id, "resume")?;
+        let ResumeSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            meta,
+            ..
+        } = request.clone();
+        let child_response = self
+            .codex
+            .resume_session(
+                ResumeSessionRequest::new(child_session_id.clone(), cwd.clone())
+                    .mcp_servers(mcp_servers.clone())
+                    .meta(meta.clone()),
+            )
+            .await?;
+        let child_backend_options = child_response.config_options.clone().unwrap_or_default();
+        self.register_routed_session(
+            session_id,
+            BackendKind::Codex,
+            child_session_id,
+            child_backend_options.clone(),
+            cwd,
+            mcp_servers,
+            meta,
+        );
+
+        Ok(ResumeSessionResponse::new()
+            .modes(child_response.modes)
+            .models(child_response.models)
+            .config_options(Some(Self::merge_active_options(
+                BackendKind::Codex,
+                child_backend_options,
+            )))
+            .meta(child_response.meta))
+    }
+
     async fn list_sessions(
         &self,
-        _request: ListSessionsRequest,
+        request: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, Error> {
-        let sessions = self
+        if request.cursor.as_deref() == Some(MULTI_ROUTED_CURSOR) {
+            return Ok(ListSessionsResponse::new(
+                self.listable_routed_sessions(request.cwd.as_ref()),
+            ));
+        }
+
+        let mut codex_request = request.clone();
+        codex_request.cursor = request
+            .cursor
+            .as_deref()
+            .and_then(Self::unwrap_codex_cursor)
+            .or_else(|| request.cursor.clone());
+
+        let mut response = self.codex.list_sessions(codex_request).await?;
+        if let Some(next_cursor) = response.next_cursor.take() {
+            response.next_cursor = Some(Self::wrap_codex_cursor(next_cursor));
+            return Ok(response);
+        }
+
+        let routed_sessions = self.listable_routed_sessions(request.cwd.as_ref());
+        if request.cursor.is_some() {
+            if !routed_sessions.is_empty() {
+                response.next_cursor = Some(MULTI_ROUTED_CURSOR.to_string());
+            }
+            return Ok(response);
+        }
+
+        let mut seen = response
             .sessions
-            .borrow()
             .iter()
-            .map(|(id, s)| {
-                SessionInfo::new(id.clone(), s.cwd.clone())
-                    .title(format!("Unified session [{}]", s.active_backend.as_str()))
-            })
-            .collect::<Vec<_>>();
-        Ok(ListSessionsResponse::new(sessions))
+            .map(|session| session.session_id.0.to_string())
+            .collect::<HashSet<_>>();
+        for session in routed_sessions {
+            if seen.insert(session.session_id.0.to_string()) {
+                response.sessions.push(session);
+            }
+        }
+
+        Ok(response)
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
@@ -438,5 +633,485 @@ impl BackendDriver for MultiBackendDriver {
             }
         }
         Ok(SetSessionConfigOptionResponse::new(merged_options).meta(response.meta))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MultiBackendDriver;
+    use crate::backend::{BackendDriver, BackendKind};
+    use agent_client_protocol::{
+        AuthMethod, AuthenticateRequest, AuthenticateResponse, CancelNotification, Error,
+        ForkSessionRequest, ForkSessionResponse, ListSessionsRequest, ListSessionsResponse,
+        LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+        PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+        SessionConfigOption, SessionId, SessionInfo, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+        SetSessionModelRequest, SetSessionModelResponse, StopReason,
+    };
+    use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+
+    struct StubDriver {
+        backend: BackendKind,
+        sessions: RefCell<Vec<SessionInfo>>,
+        list_responses: RefCell<HashMap<Option<String>, ListSessionsResponse>>,
+        supports_load_session: bool,
+        supports_fork_session: bool,
+        supports_resume_session: bool,
+        fork_response: RefCell<Option<ForkSessionResponse>>,
+        resume_response: RefCell<Option<ResumeSessionResponse>>,
+        fork_requests: RefCell<Vec<ForkSessionRequest>>,
+        resume_requests: RefCell<Vec<ResumeSessionRequest>>,
+    }
+
+    impl StubDriver {
+        fn new(
+            backend: BackendKind,
+            sessions: Vec<SessionInfo>,
+            supports_load_session: bool,
+        ) -> Self {
+            Self {
+                backend,
+                sessions: RefCell::new(sessions),
+                list_responses: RefCell::new(HashMap::new()),
+                supports_load_session,
+                supports_fork_session: false,
+                supports_resume_session: false,
+                fork_response: RefCell::new(None),
+                resume_response: RefCell::new(None),
+                fork_requests: RefCell::new(Vec::new()),
+                resume_requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_list_responses(
+            backend: BackendKind,
+            sessions: Vec<SessionInfo>,
+            list_responses: HashMap<Option<String>, ListSessionsResponse>,
+            supports_load_session: bool,
+        ) -> Self {
+            Self {
+                backend,
+                sessions: RefCell::new(sessions),
+                list_responses: RefCell::new(list_responses),
+                supports_load_session,
+                supports_fork_session: false,
+                supports_resume_session: false,
+                fork_response: RefCell::new(None),
+                resume_response: RefCell::new(None),
+                fork_requests: RefCell::new(Vec::new()),
+                resume_requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_fork_response(mut self, response: ForkSessionResponse) -> Self {
+            self.supports_fork_session = true;
+            self.fork_response = RefCell::new(Some(response));
+            self
+        }
+
+        fn with_resume_response(mut self, response: ResumeSessionResponse) -> Self {
+            self.supports_resume_session = true;
+            self.resume_response = RefCell::new(Some(response));
+            self
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl BackendDriver for StubDriver {
+        fn backend_kind(&self) -> BackendKind {
+            self.backend
+        }
+
+        fn supports_load_session(&self) -> bool {
+            self.supports_load_session
+        }
+
+        fn supports_fork_session(&self) -> bool {
+            self.supports_fork_session
+        }
+
+        fn supports_resume_session(&self) -> bool {
+            self.supports_resume_session
+        }
+
+        fn auth_methods(&self) -> Vec<AuthMethod> {
+            Vec::new()
+        }
+
+        async fn authenticate(
+            &self,
+            _request: AuthenticateRequest,
+        ) -> Result<AuthenticateResponse, Error> {
+            Ok(AuthenticateResponse::new())
+        }
+
+        async fn new_session(
+            &self,
+            request: NewSessionRequest,
+        ) -> Result<NewSessionResponse, Error> {
+            let session_id = SessionId::new(format!("{}:stub", self.backend.as_str()));
+            self.sessions.borrow_mut().push(
+                SessionInfo::new(session_id.clone(), request.cwd).title(self.backend.as_str()),
+            );
+            Ok(NewSessionResponse::new(session_id))
+        }
+
+        async fn load_session(
+            &self,
+            _request: LoadSessionRequest,
+        ) -> Result<LoadSessionResponse, Error> {
+            Err(Error::invalid_params().data("unsupported"))
+        }
+
+        async fn fork_session(
+            &self,
+            request: ForkSessionRequest,
+        ) -> Result<ForkSessionResponse, Error> {
+            self.fork_requests.borrow_mut().push(request);
+            self.fork_response
+                .borrow()
+                .clone()
+                .ok_or_else(|| Error::invalid_params().data("unsupported"))
+        }
+
+        async fn resume_session(
+            &self,
+            request: ResumeSessionRequest,
+        ) -> Result<ResumeSessionResponse, Error> {
+            self.resume_requests.borrow_mut().push(request);
+            self.resume_response
+                .borrow()
+                .clone()
+                .ok_or_else(|| Error::invalid_params().data("unsupported"))
+        }
+
+        async fn list_sessions(
+            &self,
+            request: ListSessionsRequest,
+        ) -> Result<ListSessionsResponse, Error> {
+            if let Some(response) = self.list_responses.borrow().get(&request.cursor).cloned() {
+                return Ok(response);
+            }
+            Ok(ListSessionsResponse::new(self.sessions.borrow().clone()))
+        }
+
+        async fn prompt(&self, _request: PromptRequest) -> Result<PromptResponse, Error> {
+            Ok(PromptResponse::new(StopReason::EndTurn))
+        }
+
+        async fn cancel(&self, _args: CancelNotification) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn set_session_mode(
+            &self,
+            _args: SetSessionModeRequest,
+        ) -> Result<SetSessionModeResponse, Error> {
+            Err(Error::invalid_params().data("unsupported"))
+        }
+
+        async fn set_session_model(
+            &self,
+            _args: SetSessionModelRequest,
+        ) -> Result<SetSessionModelResponse, Error> {
+            Err(Error::invalid_params().data("unsupported"))
+        }
+
+        async fn set_session_config_option(
+            &self,
+            _args: SetSessionConfigOptionRequest,
+        ) -> Result<SetSessionConfigOptionResponse, Error> {
+            Err(Error::invalid_params().data("unsupported"))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_sessions_merges_codex_and_routed_sessions() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let codex_session = SessionInfo::new("codex:existing", cwd.clone()).title("Codex stored");
+        let driver = MultiBackendDriver::new(
+            Rc::new(StubDriver::new(
+                BackendKind::Codex,
+                vec![codex_session],
+                true,
+            )),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+
+        let created = driver
+            .new_session(NewSessionRequest::new(cwd.clone()))
+            .await
+            .unwrap();
+        let response = driver
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+
+        let ids = response
+            .sessions
+            .iter()
+            .map(|session| session.session_id.0.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(ids.iter().any(|id| id == "codex:existing"));
+        assert!(ids.iter().any(|id| id == created.session_id.0.as_ref()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_sessions_dedupes_loaded_codex_session_ids() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let codex_id = SessionId::new("codex:existing");
+        let codex_session = SessionInfo::new(codex_id.clone(), cwd.clone()).title("Codex stored");
+        let driver = MultiBackendDriver::new(
+            Rc::new(StubDriver::new(
+                BackendKind::Codex,
+                vec![codex_session],
+                true,
+            )),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+
+        driver.sessions.borrow_mut().insert(
+            codex_id.clone(),
+            super::RoutedSession {
+                active_backend: BackendKind::Codex,
+                backend_sessions: HashMap::from([(BackendKind::Codex, codex_id.clone())]),
+                backend_config_options: HashMap::new(),
+                cwd: cwd.clone(),
+                mcp_servers: Vec::new(),
+                meta: None,
+            },
+        );
+
+        let response = driver
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let count = response
+            .sessions
+            .iter()
+            .filter(|session| session.session_id == codex_id)
+            .count();
+
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_sessions_defers_routed_sessions_until_codex_pages_finish() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let first_page = ListSessionsResponse::new(vec![
+            SessionInfo::new("codex:page-1", cwd.clone()).title("Codex page 1"),
+        ])
+        .next_cursor("page-2");
+        let second_page = ListSessionsResponse::new(vec![
+            SessionInfo::new("codex:page-2", cwd.clone()).title("Codex page 2"),
+        ]);
+
+        let driver = MultiBackendDriver::new(
+            Rc::new(StubDriver::with_list_responses(
+                BackendKind::Codex,
+                Vec::new(),
+                HashMap::from([
+                    (None, first_page),
+                    (Some("page-2".to_string()), second_page),
+                ]),
+                true,
+            )),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+
+        let created = driver
+            .new_session(NewSessionRequest::new(cwd.clone()))
+            .await
+            .unwrap();
+
+        let first = driver
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let first_ids = first
+            .sessions
+            .iter()
+            .map(|session| session.session_id.0.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, vec!["codex:page-1"]);
+        assert_eq!(first.next_cursor.as_deref(), Some("multi:codex:page-2"));
+
+        let second = driver
+            .list_sessions(
+                ListSessionsRequest::new()
+                    .cursor(first.next_cursor.clone().expect("cursor should exist")),
+            )
+            .await
+            .unwrap();
+        let second_ids = second
+            .sessions
+            .iter()
+            .map(|session| session.session_id.0.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids, vec!["codex:page-2"]);
+        assert_eq!(second.next_cursor.as_deref(), Some("multi:routed"));
+
+        let routed = driver
+            .list_sessions(
+                ListSessionsRequest::new().cursor(
+                    second
+                        .next_cursor
+                        .clone()
+                        .expect("routed cursor should exist"),
+                ),
+            )
+            .await
+            .unwrap();
+        let routed_ids = routed
+            .sessions
+            .iter()
+            .map(|session| session.session_id.0.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(routed_ids, vec![created.session_id.0.to_string()]);
+        assert_eq!(routed.next_cursor, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_session_wraps_codex_child_in_synthetic_multi_session() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let codex = Rc::new(
+            StubDriver::new(BackendKind::Codex, Vec::new(), true).with_fork_response(
+                ForkSessionResponse::new("codex:forked").config_options(vec![
+                    SessionConfigOption::select(
+                        "model",
+                        "Model",
+                        "gpt-5",
+                        vec![agent_client_protocol::SessionConfigSelectOption::new(
+                            "gpt-5", "GPT-5",
+                        )],
+                    ),
+                ]),
+            ),
+        );
+        let driver = MultiBackendDriver::new(
+            codex.clone(),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+
+        let response = driver
+            .fork_session(ForkSessionRequest::new("codex:source", cwd.clone()))
+            .await
+            .unwrap();
+
+        assert!(response.session_id.0.as_ref().starts_with("multi:"));
+        assert_eq!(
+            codex.fork_requests.borrow()[0].session_id.0.as_ref(),
+            "codex:source"
+        );
+        let route = driver.sessions.borrow();
+        let stored = route.get(&response.session_id).unwrap();
+        assert_eq!(stored.active_backend, BackendKind::Codex);
+        assert_eq!(
+            stored
+                .backend_sessions
+                .get(&BackendKind::Codex)
+                .unwrap()
+                .0
+                .as_ref(),
+            "codex:forked"
+        );
+        let option_ids = response
+            .config_options
+            .unwrap()
+            .into_iter()
+            .map(|option| option.id.0.to_string())
+            .collect::<Vec<_>>();
+        assert!(option_ids.iter().any(|id| id == "backend"));
+        assert!(option_ids.iter().any(|id| id == "model"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_session_rejects_non_codex_routed_session() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let driver = MultiBackendDriver::new(
+            Rc::new(StubDriver::new(BackendKind::Codex, Vec::new(), true)),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+        let session_id = SessionId::new("multi:test");
+        driver.sessions.borrow_mut().insert(
+            session_id.clone(),
+            super::RoutedSession {
+                active_backend: BackendKind::ClaudeCode,
+                backend_sessions: HashMap::from([(
+                    BackendKind::ClaudeCode,
+                    SessionId::new("claude-code:child"),
+                )]),
+                backend_config_options: HashMap::new(),
+                cwd: cwd.clone(),
+                mcp_servers: Vec::new(),
+                meta: None,
+            },
+        );
+
+        let result = driver
+            .fork_session(ForkSessionRequest::new(session_id, cwd))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_session_registers_requested_session_id_as_codex_route() {
+        let cwd = PathBuf::from("/tmp/xsfire-camp-test");
+        let codex = Rc::new(
+            StubDriver::new(BackendKind::Codex, Vec::new(), true).with_resume_response(
+                ResumeSessionResponse::new().config_options(vec![SessionConfigOption::select(
+                    "model",
+                    "Model",
+                    "gpt-5",
+                    vec![agent_client_protocol::SessionConfigSelectOption::new(
+                        "gpt-5", "GPT-5",
+                    )],
+                )]),
+            ),
+        );
+        let driver = MultiBackendDriver::new(
+            codex.clone(),
+            Rc::new(StubDriver::new(BackendKind::ClaudeCode, Vec::new(), false)),
+            Rc::new(StubDriver::new(BackendKind::Gemini, Vec::new(), false)),
+        );
+        let session_id = SessionId::new("codex:resume");
+
+        let response = driver
+            .resume_session(ResumeSessionRequest::new(session_id.clone(), cwd.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            codex.resume_requests.borrow()[0].session_id.0.as_ref(),
+            "codex:resume"
+        );
+        let route = driver.sessions.borrow();
+        let stored = route.get(&session_id).unwrap();
+        assert_eq!(stored.active_backend, BackendKind::Codex);
+        assert_eq!(
+            stored
+                .backend_sessions
+                .get(&BackendKind::Codex)
+                .unwrap()
+                .0
+                .as_ref(),
+            "codex:resume"
+        );
+        let option_ids = response
+            .config_options
+            .unwrap()
+            .into_iter()
+            .map(|option| option.id.0.to_string())
+            .collect::<Vec<_>>();
+        assert!(option_ids.iter().any(|id| id == "backend"));
+        assert!(option_ids.iter().any(|id| id == "model"));
     }
 }

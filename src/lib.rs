@@ -1,13 +1,19 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use agent_client_protocol::AgentSideConnection;
+use agent_client_protocol::{
+    AgentSideConnection, Client, CreateTerminalRequest, CreateTerminalResponse,
+    KillTerminalCommandRequest, KillTerminalCommandResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+};
 use codex_common::CliConfigOverrides;
 use codex_core::config::{Config, ConfigOverrides};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{io::Result as IoResult, rc::Rc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
@@ -29,6 +35,32 @@ pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 static ACP_CLIENT_INFO: OnceLock<Arc<Mutex<Option<String>>>> = OnceLock::new();
 static SESSION_ALIASES: OnceLock<Arc<Mutex<HashMap<String, agent_client_protocol::SessionId>>>> =
     OnceLock::new();
+static ACP_TERMINAL_RPC: OnceLock<mpsc::UnboundedSender<AcpTerminalRpc>> = OnceLock::new();
+
+type AcpTerminalRpcResult<T> = Result<T, String>;
+
+enum AcpTerminalRpc {
+    CreateTerminal {
+        request: CreateTerminalRequest,
+        respond_to: oneshot::Sender<AcpTerminalRpcResult<CreateTerminalResponse>>,
+    },
+    TerminalOutput {
+        request: TerminalOutputRequest,
+        respond_to: oneshot::Sender<AcpTerminalRpcResult<TerminalOutputResponse>>,
+    },
+    ReleaseTerminal {
+        request: ReleaseTerminalRequest,
+        respond_to: oneshot::Sender<AcpTerminalRpcResult<ReleaseTerminalResponse>>,
+    },
+    WaitForTerminalExit {
+        request: WaitForTerminalExitRequest,
+        respond_to: oneshot::Sender<AcpTerminalRpcResult<WaitForTerminalExitResponse>>,
+    },
+    KillTerminalCommand {
+        request: KillTerminalCommandRequest,
+        respond_to: oneshot::Sender<AcpTerminalRpcResult<KillTerminalCommandResponse>>,
+    },
+}
 
 fn acp_client_info() -> &'static Arc<Mutex<Option<String>>> {
     ACP_CLIENT_INFO.get_or_init(|| Arc::new(Mutex::new(None)))
@@ -65,6 +97,150 @@ pub fn resolve_session_alias(
         .get(session_id.0.as_ref())
         .cloned()
         .unwrap_or_else(|| session_id.clone())
+}
+
+async fn run_acp_terminal_rpc_loop(
+    client: Arc<AgentSideConnection>,
+    mut rx: mpsc::UnboundedReceiver<AcpTerminalRpc>,
+) {
+    while let Some(message) = rx.recv().await {
+        match message {
+            AcpTerminalRpc::CreateTerminal {
+                request,
+                respond_to,
+            } => {
+                drop(
+                    respond_to.send(
+                        client
+                            .create_terminal(request)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    ),
+                );
+            }
+            AcpTerminalRpc::TerminalOutput {
+                request,
+                respond_to,
+            } => {
+                drop(
+                    respond_to.send(
+                        client
+                            .terminal_output(request)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    ),
+                );
+            }
+            AcpTerminalRpc::ReleaseTerminal {
+                request,
+                respond_to,
+            } => {
+                drop(
+                    respond_to.send(
+                        client
+                            .release_terminal(request)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    ),
+                );
+            }
+            AcpTerminalRpc::WaitForTerminalExit {
+                request,
+                respond_to,
+            } => {
+                drop(
+                    respond_to.send(
+                        client
+                            .wait_for_terminal_exit(request)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    ),
+                );
+            }
+            AcpTerminalRpc::KillTerminalCommand {
+                request,
+                respond_to,
+            } => {
+                drop(
+                    respond_to.send(
+                        client
+                            .kill_terminal_command(request)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+async fn dispatch_acp_terminal_rpc<T>(
+    message: impl FnOnce(oneshot::Sender<AcpTerminalRpcResult<T>>) -> AcpTerminalRpc,
+) -> AcpTerminalRpcResult<T>
+where
+    T: Send + 'static,
+{
+    let sender = ACP_TERMINAL_RPC
+        .get()
+        .cloned()
+        .ok_or_else(|| "ACP terminal bridge is unavailable".to_string())?;
+    let (respond_to, response_rx) = oneshot::channel();
+    sender
+        .send(message(respond_to))
+        .map_err(|_| "ACP terminal bridge closed".to_string())?;
+    response_rx
+        .await
+        .map_err(|_| "ACP terminal bridge response dropped".to_string())?
+}
+
+pub(crate) async fn acp_create_terminal(
+    request: CreateTerminalRequest,
+) -> AcpTerminalRpcResult<CreateTerminalResponse> {
+    dispatch_acp_terminal_rpc(|respond_to| AcpTerminalRpc::CreateTerminal {
+        request,
+        respond_to,
+    })
+    .await
+}
+
+pub(crate) async fn acp_terminal_output(
+    request: TerminalOutputRequest,
+) -> AcpTerminalRpcResult<TerminalOutputResponse> {
+    dispatch_acp_terminal_rpc(|respond_to| AcpTerminalRpc::TerminalOutput {
+        request,
+        respond_to,
+    })
+    .await
+}
+
+pub(crate) async fn acp_release_terminal(
+    request: ReleaseTerminalRequest,
+) -> AcpTerminalRpcResult<ReleaseTerminalResponse> {
+    dispatch_acp_terminal_rpc(|respond_to| AcpTerminalRpc::ReleaseTerminal {
+        request,
+        respond_to,
+    })
+    .await
+}
+
+pub(crate) async fn acp_wait_for_terminal_exit(
+    request: WaitForTerminalExitRequest,
+) -> AcpTerminalRpcResult<WaitForTerminalExitResponse> {
+    dispatch_acp_terminal_rpc(|respond_to| AcpTerminalRpc::WaitForTerminalExit {
+        request,
+        respond_to,
+    })
+    .await
+}
+
+pub(crate) async fn acp_kill_terminal_command(
+    request: KillTerminalCommandRequest,
+) -> AcpTerminalRpcResult<KillTerminalCommandResponse> {
+    dispatch_acp_terminal_rpc(|respond_to| AcpTerminalRpc::KillTerminalCommand {
+        request,
+        respond_to,
+    })
+    .await
 }
 
 /// Run the Codex ACP agent.
@@ -144,9 +320,15 @@ pub async fn run_main(
                 tokio::task::spawn_local(fut);
             });
 
-            if ACP_CLIENT.set(Arc::new(client)).is_err() {
+            let client = Arc::new(client);
+            if ACP_CLIENT.set(client.clone()).is_err() {
                 return Err(std::io::Error::other("ACP client already set"));
             }
+            let (terminal_rpc_tx, terminal_rpc_rx) = mpsc::unbounded_channel();
+            if ACP_TERMINAL_RPC.set(terminal_rpc_tx).is_err() {
+                return Err(std::io::Error::other("ACP terminal bridge already set"));
+            }
+            tokio::task::spawn_local(run_acp_terminal_rpc_loop(client, terminal_rpc_rx));
 
             io_task
                 .await

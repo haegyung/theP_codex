@@ -80,25 +80,39 @@
 - `sessionCapabilities`:
   - `list` 지원 광고
 - `loadSession`:
-  - `--backend=codex`일 때만 `true`
+  - `--backend=codex`, `--backend=multi`일 때 `true`
+  - `multi`는 `codex` 세션만 load 가능
   - 그 외 백엔드는 `false`
 
 ### 3-2. 백엔드별 ACP 메서드 지원 현황
 
 | ACP 항목 | `codex` | `claude-code` | `gemini` |
 |---|---|---|---|
-| `authenticate` | 지원 (ChatGPT/API key 방식) | 형식상 성공 반환, 실제 로그인은 CLI 선행 필요 | 형식상 성공 반환, 실제 로그인은 CLI 선행 필요 |
+| `authenticate` | 지원 (ChatGPT/API key 방식) | 지원 (`claude auth status` 검증, interactive login 시작은 미지원) | 부분 지원 (CLI 가용성 + auth 설정 준비 상태 검증, interactive login/status 실행은 미지원) |
 | `session/new` | 지원 (지속형 세션) | 지원 (in-memory 세션) | 지원 (in-memory 세션) |
 | `session/load` | 지원 | 미지원 (`invalid_params`) | 미지원 (`invalid_params`) |
 | `session/list` | 지원 (`CODEX_HOME` 기반 목록) | 지원 (현재 프로세스 메모리 목록) | 지원 (현재 프로세스 메모리 목록) |
 | `session/prompt` | 지원 (스트리밍/툴콜/승인/플랜 포함) | 지원 (원샷 텍스트 청크 중심) | 지원 (원샷 텍스트 청크 중심) |
-| `session/cancel` | 지원 (실행 중 turn 취소) | no-op 성공 반환 | no-op 성공 반환 |
+| `session/cancel` | 지원 (실행 중 turn 취소) | 지원 (실행 중 CLI prompt 취소) | 지원 (실행 중 CLI prompt 취소) |
 | `session/set_mode` | 지원 | 미지원 (`invalid_params`) | 미지원 (`invalid_params`) |
-| `session/set_model` (unstable) | 지원 | 미지원 (`invalid_params`) | 미지원 (`invalid_params`) |
-| `session/set_config_option` (unstable) | 지원 | 미지원 (`invalid_params`) | 미지원 (`invalid_params`) |
-| `session/fork` (unstable) | 미지원 | 미지원 | 미지원 |
-| `session/resume` (unstable) | 미지원 | 미지원 | 미지원 |
+| `session/set_model` (unstable) | 지원 | 지원 | 지원 |
+| `session/set_config_option` (unstable) | 지원 | 지원 (`model`만) | 지원 (`model`만) |
+| `session/fork` (unstable) | 지원 | 미지원 | 미지원 |
+| `session/resume` (unstable) | 지원 | 미지원 | 미지원 |
 | ext method/notification | 기본 동작(no-op/null) | 기본 동작(no-op/null) | 기본 동작(no-op/null) |
+
+`multi` 백엔드는 다음처럼 동작합니다.
+
+- `authenticate`: method id에 따라 `codex` / `claude-code` / `gemini`로 위임
+- `session/load`: `codex` 세션만 load 가능
+- `session/list`: `codex`의 load 가능한 세션 목록과 현재 프로세스의 routed session 목록을 함께 노출
+  - 첫 페이지부터 `codex` 목록을 우선 반환합니다.
+  - `codex`에 다음 페이지가 있으면 `nextCursor`는 `multi:codex:<cursor>` 형태로 래핑됩니다.
+  - `codex` 페이지가 끝난 뒤 routed session이 남아 있으면 마지막 커서는 `multi:routed`를 반환합니다.
+  - routed session 목록에는 synthetic id(`multi:*`)만 포함되며, `load_session`으로 가져온 `codex` 세션은 `codex` 목록에서 계속 발견됩니다.
+- `session/fork`: `codex` 세션 id 또는 `codex`-backed routed session만 지원하며, 결과는 새로운 synthetic routed session id(`multi:*`)로 감쌉니다.
+- `session/resume`: `codex` 세션 id 또는 `codex`-backed routed session만 지원하며, 요청한 session id를 유지한 채 `codex` 자식 세션에 다시 연결합니다.
+- `session/set_config_option`의 `backend`: 현재 thread의 활성 backend 전환
 
 ### 3-3. 세션 업데이트(`session/update`) 동작
 
@@ -124,7 +138,11 @@
   - ACP 파일 API 경로에는 세션 루트(`cwd`) 바깥 접근 차단 검사가 적용됩니다.
   - 로컬 FS fallback 경로는 백엔드 sandbox/권한 정책에 의해 별도로 통제됩니다.
 - 터미널:
-  - 클라이언트 capability에 따라 terminal 연동이 동작하며, 실행 흐름은 ToolCall 업데이트로 노출됩니다.
+  - `codex` backend의 exec는 ACP client RPC `terminal/create -> terminal/output -> terminal/release`로 구동됩니다.
+  - 취소/정리 경로는 `terminal/kill -> terminal/wait_for_exit -> terminal/release`를 사용합니다.
+  - `clientCapabilities.terminal=true`를 광고한 표준 클라이언트는 ACP client가 돌려준 실제 `terminal_id`를 `ToolCallContent::Terminal`로 받습니다.
+  - `_meta.terminal_output=true`를 광고한 legacy 클라이언트는 embedded terminal 뷰 호환을 위해 `_meta.terminal_output`/`terminal_exit` 확장을 계속 받습니다.
+  - plain-text `ToolCallUpdate` fallback은 exec 계층에서 실제 `terminal_id`를 확보하지 못한 경우에만 사용합니다.
 
 ### 3-5. 저장소/로그 연속성
 
@@ -145,8 +163,10 @@
 
 1. `session/list`, `session/set_model`, `session/set_config_option`은 ACP unstable 영역이므로 스키마 변경에 대비해야 합니다.
 2. `claude-code`, `gemini` 백엔드는 ACP 표면은 유지하지만, 현재는 최소 구현(in-memory + 원샷 프롬프트)입니다.
-3. `session/fork`, `session/resume`은 아직 미지원입니다.
-4. ext method는 현재 기본 no-op이므로, 확장 기능이 필요하면 명시 구현이 필요합니다.
+3. `claude-code`의 `authenticate`는 CLI auth status를 검증하고, `gemini`의 `authenticate`는 CLI 가용성과 auth 설정 준비 상태까지 검증합니다. 다만 둘 다 interactive login/status 실행 자체는 ACP에서 직접 수행하지 않습니다.
+4. `codex` backend 터미널 연동은 ACP 표준 `terminal/*` lifecycle(`create/output/kill/wait_for_exit/release`)을 사용합니다. legacy `_meta.terminal_output` 확장은 embedded terminal UI 호환을 위해 유지되며, plain-text fallback은 실제 `terminal_id`가 없는 경우로 제한됩니다.
+5. `session/fork`, `session/resume`은 `codex`와 `multi`(`codex`-backed session만)에서만 지원합니다.
+6. ext method는 현재 기본 no-op이므로, 확장 기능이 필요하면 명시 구현이 필요합니다.
 
 ## 5) 관련 문서(정본 링크)
 

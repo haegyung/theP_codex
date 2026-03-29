@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command as StdCommand, Stdio},
     rc::Rc,
 };
+use tokio::{io::AsyncReadExt, process::Command as TokioCommand, sync::watch};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -28,6 +30,49 @@ struct GeminiSession {
     model: Option<String>,
     history: Vec<(String, String)>,
     session_store: Option<SessionStore>,
+    active_prompt: Option<watch::Sender<bool>>,
+}
+
+struct CommandRunResult {
+    stdout: String,
+    exit_code: Option<i32>,
+    cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeminiAuthType {
+    LoginWithGoogle,
+    GeminiApiKey,
+    VertexAi,
+    ComputeDefaultCredentials,
+}
+
+impl GeminiAuthType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoginWithGoogle => "oauth-personal",
+            Self::GeminiApiKey => "gemini-api-key",
+            Self::VertexAi => "vertex-ai",
+            Self::ComputeDefaultCredentials => "compute-default-credentials",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "oauth-personal" => Some(Self::LoginWithGoogle),
+            "gemini-api-key" => Some(Self::GeminiApiKey),
+            "vertex-ai" => Some(Self::VertexAi),
+            "compute-default-credentials" => Some(Self::ComputeDefaultCredentials),
+            _ => None,
+        }
+    }
+}
+
+struct GeminiAuthConfig {
+    selected_type: Option<GeminiAuthType>,
+    enforced_type: Option<GeminiAuthType>,
+    settings_path: Option<PathBuf>,
+    oauth_creds_path: Option<PathBuf>,
 }
 
 /// Gemini CLI backend driver (shells out to the `gemini` CLI).
@@ -42,6 +87,8 @@ pub struct GeminiCliDriver {
 }
 
 impl GeminiCliDriver {
+    const AUTH_METHOD_ID: &'static str = "gemini-cli";
+
     pub fn new() -> Self {
         Self {
             sessions: Rc::default(),
@@ -68,6 +115,232 @@ impl GeminiCliDriver {
         std::env::var("XSFIRE_GEMINI_MODEL").ok()
     }
 
+    fn validate_auth_method(method_id: &str) -> Result<(), Error> {
+        if method_id == Self::AUTH_METHOD_ID {
+            return Ok(());
+        }
+
+        Err(Error::invalid_params().data(format!(
+            "unsupported auth method for gemini backend: {method_id}"
+        )))
+    }
+
+    fn check_cli_available(bin: &str) -> Result<(), Error> {
+        let output = StdCommand::new(bin).arg("--version").output().map_err(|e| {
+            Error::invalid_params().data(format!(
+                "failed to execute Gemini CLI ({bin}). Install it or set XSFIRE_GEMINI_BIN. Error: {e}"
+            ))
+        })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(Error::invalid_params().data(format!(
+            "Gemini CLI is installed but not ready for ACP authenticate. Authenticate with the `gemini` CLI first. exit={:?} stdout={} stderr={}",
+            output.status.code(),
+            stdout,
+            stderr,
+        )))
+    }
+
+    fn validate_auth_configuration() -> Result<(), Error> {
+        let config = Self::load_auth_config()?;
+        let settings_path = Self::display_settings_path(config.settings_path.as_deref());
+        let effective_type = config.selected_type.or_else(Self::auth_type_from_env);
+
+        if let Some(enforced_type) = config.enforced_type {
+            match effective_type {
+                Some(current_type) if current_type == enforced_type => {}
+                Some(current_type) => {
+                    return Err(Error::invalid_params().data(format!(
+                        "Gemini CLI enforces auth type `{}` in {}, but ACP authenticate resolved `{}`. Re-authenticate or update your environment before starting.",
+                        enforced_type.as_str(),
+                        settings_path,
+                        current_type.as_str(),
+                    )));
+                }
+                None => {
+                    return Err(Error::invalid_params().data(format!(
+                        "Gemini CLI enforces auth type `{}` in {}, but no Gemini auth configuration is ready. Configure the matching auth method before starting ACP.",
+                        enforced_type.as_str(),
+                        settings_path,
+                    )));
+                }
+            }
+        }
+
+        let Some(auth_type) = effective_type else {
+            return Err(Error::invalid_params().data(format!(
+                "Gemini CLI is installed but no auth method is configured. Set an auth method in {} or export one of: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI=true, GOOGLE_GENAI_USE_GCA=true.",
+                settings_path,
+            )));
+        };
+
+        match auth_type {
+            GeminiAuthType::LoginWithGoogle => {
+                let oauth_creds_path =
+                    Self::display_oauth_creds_path(config.oauth_creds_path.as_deref());
+                let has_oauth_creds = config
+                    .oauth_creds_path
+                    .as_ref()
+                    .is_some_and(|path| path.is_file());
+                if !has_oauth_creds {
+                    return Err(Error::invalid_params().data(format!(
+                        "Gemini CLI is configured for `oauth-personal`, but {} is missing. Run `gemini` and complete login before starting ACP.",
+                        oauth_creds_path,
+                    )));
+                }
+            }
+            GeminiAuthType::GeminiApiKey => {
+                if !Self::has_env_var("GEMINI_API_KEY") {
+                    return Err(Error::invalid_params().data(
+                        "Gemini CLI is configured for `gemini-api-key`, but GEMINI_API_KEY is not set."
+                            .to_string(),
+                    ));
+                }
+            }
+            GeminiAuthType::VertexAi => {
+                let has_vertex_project_location = Self::has_env_var("GOOGLE_CLOUD_PROJECT")
+                    && Self::has_env_var("GOOGLE_CLOUD_LOCATION");
+                let has_google_api_key = Self::has_env_var("GOOGLE_API_KEY");
+                if !has_vertex_project_location && !has_google_api_key {
+                    return Err(Error::invalid_params().data(
+                        "Gemini CLI is configured for `vertex-ai`, but neither GOOGLE_API_KEY nor the GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION pair is set."
+                            .to_string(),
+                    ));
+                }
+            }
+            GeminiAuthType::ComputeDefaultCredentials => {}
+        }
+
+        Ok(())
+    }
+
+    fn load_auth_config() -> Result<GeminiAuthConfig, Error> {
+        let gemini_dir = Self::gemini_dir();
+        let settings_path = gemini_dir.as_ref().map(|path| path.join("settings.json"));
+        let oauth_creds_path = gemini_dir
+            .as_ref()
+            .map(|path| path.join("oauth_creds.json"));
+        let mut selected_type = None;
+        let mut enforced_type = None;
+
+        if let Some(settings_path) = settings_path.as_ref()
+            && settings_path.is_file()
+        {
+            let contents = fs::read_to_string(settings_path).map_err(|e| {
+                Error::invalid_params().data(format!(
+                    "failed to read Gemini settings from {}: {e}",
+                    settings_path.display()
+                ))
+            })?;
+            let settings: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+                Error::invalid_params().data(format!(
+                    "failed to parse Gemini settings from {}: {e}",
+                    settings_path.display()
+                ))
+            })?;
+            selected_type = Self::settings_auth_type(
+                &settings,
+                &["security", "auth", "selectedType"],
+                settings_path,
+            )?;
+            enforced_type = Self::settings_auth_type(
+                &settings,
+                &["security", "auth", "enforcedType"],
+                settings_path,
+            )?;
+        }
+
+        Ok(GeminiAuthConfig {
+            selected_type,
+            enforced_type,
+            settings_path,
+            oauth_creds_path,
+        })
+    }
+
+    fn settings_auth_type(
+        value: &serde_json::Value,
+        path: &[&str],
+        settings_path: &Path,
+    ) -> Result<Option<GeminiAuthType>, Error> {
+        let mut current = value;
+        for segment in path {
+            let Some(next) = current.get(*segment) else {
+                return Ok(None);
+            };
+            current = next;
+        }
+
+        if current.is_null() {
+            return Ok(None);
+        }
+
+        let Some(raw_value) = current.as_str() else {
+            return Err(Error::invalid_params().data(format!(
+                "Gemini settings {} contains a non-string value at {}.",
+                settings_path.display(),
+                path.join("."),
+            )));
+        };
+
+        GeminiAuthType::from_str(raw_value)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::invalid_params().data(format!(
+                    "Gemini settings {} contains unsupported auth value `{}` at {}.",
+                    settings_path.display(),
+                    raw_value,
+                    path.join("."),
+                ))
+            })
+    }
+
+    fn auth_type_from_env() -> Option<GeminiAuthType> {
+        if matches!(std::env::var("GOOGLE_GENAI_USE_GCA").as_deref(), Ok("true")) {
+            return Some(GeminiAuthType::LoginWithGoogle);
+        }
+        if matches!(
+            std::env::var("GOOGLE_GENAI_USE_VERTEXAI").as_deref(),
+            Ok("true")
+        ) {
+            return Some(GeminiAuthType::VertexAi);
+        }
+        if Self::has_env_var("GEMINI_API_KEY") {
+            return Some(GeminiAuthType::GeminiApiKey);
+        }
+        None
+    }
+
+    fn has_env_var(key: &str) -> bool {
+        std::env::var_os(key).is_some_and(|value| !value.is_empty())
+    }
+
+    fn gemini_dir() -> Option<PathBuf> {
+        Self::home_dir().map(|path| path.join(".gemini"))
+    }
+
+    fn home_dir() -> Option<PathBuf> {
+        std::env::var_os("USERPROFILE")
+            .filter(|path| !path.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|path| !path.is_empty()))
+            .map(PathBuf::from)
+    }
+
+    fn display_settings_path(path: Option<&Path>) -> String {
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.gemini/settings.json".to_string())
+    }
+
+    fn display_oauth_creds_path(path: Option<&Path>) -> String {
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.gemini/oauth_creds.json".to_string())
+    }
+
     fn config_options(current_model: Option<String>) -> Vec<SessionConfigOption> {
         let current_value = current_model.unwrap_or_else(|| "default".to_string());
         vec![
@@ -92,45 +365,103 @@ impl GeminiCliDriver {
         cwd: PathBuf,
         model: Option<String>,
         prompt: String,
-    ) -> Result<String, Error> {
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> Result<CommandRunResult, Error> {
         let bin = Self::bin();
         let bin_display = bin.clone();
         let extra_args = Self::extra_args();
         let approval_mode = Self::approval_mode();
 
-        let output = tokio::task::spawn_blocking(move || {
-            let mut cmd = Command::new(&bin);
-            cmd.current_dir(&cwd);
-            cmd.arg("--output-format");
-            cmd.arg("text");
-            cmd.arg("--approval-mode");
-            cmd.arg(approval_mode);
-            if let Some(model) = model {
-                cmd.arg("--model");
-                cmd.arg(model);
-            }
-            cmd.args(extra_args);
-            cmd.arg("--prompt");
-            cmd.arg(prompt);
-            cmd.output()
-        })
-        .await
-        .map_err(|e| Error::internal_error().data(e.to_string()))?
-        .map_err(|e| {
+        let mut cmd = TokioCommand::new(&bin);
+        cmd.current_dir(&cwd);
+        cmd.arg("--output-format");
+        cmd.arg("text");
+        cmd.arg("--approval-mode");
+        cmd.arg(approval_mode);
+        if let Some(model) = model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+        cmd.args(extra_args);
+        cmd.arg("--prompt");
+        cmd.arg(prompt);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
             Error::invalid_params().data(format!(
                 "failed to execute Gemini CLI ({bin_display}). Install it or set XSFIRE_GEMINI_BIN. Error: {e}"
             ))
         })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::internal_error().data("Gemini CLI stdout pipe missing"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::internal_error().data("Gemini CLI stderr pipe missing"))?;
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stdout
+                .read_to_end(&mut buf)
+                .await
+                .map(|_| buf)
+                .map_err(|e| Error::internal_error().data(e.to_string()))
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stderr
+                .read_to_end(&mut buf)
+                .await
+                .map(|_| buf)
+                .map_err(|e| Error::internal_error().data(e.to_string()))
+        });
+
+        let (status, cancelled) = tokio::select! {
+            result = child.wait() => (
+                result.map_err(|e| Error::internal_error().data(e.to_string()))?,
+                false,
+            ),
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    drop(child.start_kill());
+                    (
+                        child.wait().await.map_err(|e| Error::internal_error().data(e.to_string()))?,
+                        true,
+                    )
+                } else {
+                    (
+                        child.wait().await.map_err(|e| Error::internal_error().data(e.to_string()))?,
+                        false,
+                    )
+                }
+            }
+        };
+
+        let stdout_bytes = stdout_task
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))??;
+        let stderr_bytes = stderr_task
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))??;
+        let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+        if !cancelled && !status.success() {
             return Err(Error::internal_error().data(format!(
                 "Gemini CLI failed (exit {:?}). stderr:\n{stderr}",
-                output.status.code()
+                status.code()
             )));
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(CommandRunResult {
+            stdout,
+            exit_code: status.code(),
+            cancelled,
+        })
     }
 }
 
@@ -169,16 +500,19 @@ impl BackendDriver for GeminiCliDriver {
 
     fn auth_methods(&self) -> Vec<AuthMethod> {
         vec![AuthMethod::new(
-            "gemini-cli",
+            Self::AUTH_METHOD_ID,
             "Gemini CLI (pre-authenticated)",
         )
-        .description("Authenticate using the `gemini` CLI before starting. This adapter shells out to the CLI in non-interactive mode.")]
+        .description("Authenticate using the `gemini` CLI before starting. ACP authenticate validates CLI availability plus Gemini auth configuration readiness, but cannot launch or verify the interactive login flow.")]
     }
 
     async fn authenticate(
         &self,
-        _request: AuthenticateRequest,
+        request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
+        Self::validate_auth_method(request.method_id.0.as_ref())?;
+        Self::check_cli_available(&Self::bin())?;
+        Self::validate_auth_configuration()?;
         Ok(AuthenticateResponse::new())
     }
 
@@ -194,6 +528,7 @@ impl BackendDriver for GeminiCliDriver {
                 model: Self::default_model(),
                 history: Vec::new(),
                 session_store,
+                active_prompt: None,
             },
         );
 
@@ -293,11 +628,17 @@ impl BackendDriver for GeminiCliDriver {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        let (cwd, model, full_prompt) = {
-            let sessions = self.sessions.borrow();
-            let Some(session) = sessions.get(&session_id) else {
+        let (cwd, model, full_prompt, cancel_rx) = {
+            let mut sessions = self.sessions.borrow_mut();
+            let Some(session) = sessions.get_mut(&session_id) else {
                 return Err(Error::resource_not_found(None));
             };
+            if session.active_prompt.is_some() {
+                return Err(Error::invalid_params().data(format!(
+                    "a Gemini prompt is already running for session {}",
+                    session_id
+                )));
+            }
 
             let mut full_prompt = String::new();
             for (user, assistant) in session.history.iter().rev().take(6).rev() {
@@ -310,11 +651,34 @@ impl BackendDriver for GeminiCliDriver {
             full_prompt.push_str("User:\n");
             full_prompt.push_str(&user_text);
 
-            (session.cwd.clone(), session.model.clone(), full_prompt)
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            session.active_prompt = Some(cancel_tx);
+
+            (
+                session.cwd.clone(),
+                session.model.clone(),
+                full_prompt,
+                cancel_rx,
+            )
         };
 
-        let output = self.run_gemini(cwd, model, full_prompt).await?;
-        let output_text = output.trim_end_matches('\n').to_string();
+        let output = self.run_gemini(cwd, model, full_prompt, cancel_rx).await;
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.active_prompt = None;
+            }
+        }
+        let output = output?;
+        if output.cancelled {
+            debug!(
+                "Gemini prompt cancelled for session {} (exit {:?})",
+                session_id, output.exit_code
+            );
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
+
+        let output_text = output.stdout.trim_end_matches('\n').to_string();
         {
             let sessions = self.sessions.borrow();
             if let Some(session) = sessions.get(&session_id)
@@ -339,7 +703,14 @@ impl BackendDriver for GeminiCliDriver {
         Ok(PromptResponse::new(StopReason::EndTurn))
     }
 
-    async fn cancel(&self, _args: CancelNotification) -> Result<(), Error> {
+    async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
+        let sessions = self.sessions.borrow();
+        let Some(session) = sessions.get(&args.session_id) else {
+            return Err(Error::resource_not_found(None));
+        };
+        if let Some(cancel_tx) = &session.active_prompt {
+            let _ = cancel_tx.send(true);
+        }
         Ok(())
     }
 
@@ -407,5 +778,509 @@ impl GeminiCliDriver {
             session_id.0.to_string(),
             Some(cwd),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GeminiCliDriver;
+    use crate::backend::BackendDriver;
+    use agent_client_protocol::{
+        AuthenticateRequest, CancelNotification, Error, NewSessionRequest, PromptRequest,
+        SessionConfigKind, SetSessionConfigOptionRequest, SetSessionModelRequest, StopReason,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+    use uuid::Uuid;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    struct TempEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+        cleanup_dir: Option<PathBuf>,
+    }
+
+    impl Drop for TempEnvVar {
+        fn drop(&mut self) {
+            // Safe in tests when serialized by ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+            if let Some(dir) = &self.cleanup_dir {
+                drop(fs::remove_dir_all(dir));
+            }
+        }
+    }
+
+    fn install_fake_gemini_bin() -> TempEnvVar {
+        let temp_dir = std::env::temp_dir().join(format!("xsfire-gemini-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let script_path = write_fake_gemini_script(&temp_dir);
+        let previous = std::env::var("XSFIRE_GEMINI_BIN").ok();
+        // Safe in tests when serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("XSFIRE_GEMINI_BIN", &script_path);
+        }
+        TempEnvVar {
+            key: "XSFIRE_GEMINI_BIN",
+            previous,
+            cleanup_dir: Some(temp_dir),
+        }
+    }
+
+    fn set_temp_env_var(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> TempEnvVar {
+        let previous = std::env::var(key).ok();
+        // Safe in tests when serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        TempEnvVar {
+            key,
+            previous,
+            cleanup_dir: None,
+        }
+    }
+
+    fn unset_temp_env_var(key: &'static str) -> TempEnvVar {
+        let previous = std::env::var(key).ok();
+        // Safe in tests when serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        TempEnvVar {
+            key,
+            previous,
+            cleanup_dir: None,
+        }
+    }
+
+    fn clear_gemini_auth_env() -> Vec<TempEnvVar> {
+        vec![
+            unset_temp_env_var("GEMINI_API_KEY"),
+            unset_temp_env_var("GOOGLE_API_KEY"),
+            unset_temp_env_var("GOOGLE_CLOUD_PROJECT"),
+            unset_temp_env_var("GOOGLE_CLOUD_LOCATION"),
+            unset_temp_env_var("GOOGLE_GENAI_USE_GCA"),
+            unset_temp_env_var("GOOGLE_GENAI_USE_VERTEXAI"),
+        ]
+    }
+
+    struct FakeGeminiHome {
+        _home: TempEnvVar,
+        _userprofile: TempEnvVar,
+    }
+
+    fn install_fake_gemini_home(
+        selected_type: Option<&str>,
+        enforced_type: Option<&str>,
+        with_oauth_creds: bool,
+    ) -> FakeGeminiHome {
+        let home_dir = std::env::temp_dir().join(format!("xsfire-gemini-home-{}", Uuid::new_v4()));
+        let gemini_dir = home_dir.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+
+        if selected_type.is_some() || enforced_type.is_some() {
+            let mut auth = serde_json::Map::new();
+            if let Some(selected_type) = selected_type {
+                auth.insert(
+                    "selectedType".to_string(),
+                    serde_json::Value::String(selected_type.to_string()),
+                );
+            }
+            if let Some(enforced_type) = enforced_type {
+                auth.insert(
+                    "enforcedType".to_string(),
+                    serde_json::Value::String(enforced_type.to_string()),
+                );
+            }
+
+            let settings = serde_json::json!({
+                "security": {
+                    "auth": auth,
+                }
+            });
+            fs::write(
+                gemini_dir.join("settings.json"),
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+        }
+
+        if with_oauth_creds {
+            fs::write(gemini_dir.join("oauth_creds.json"), "{}").unwrap();
+        }
+
+        let previous_home = std::env::var("HOME").ok();
+        // Safe in tests when serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+        let home_guard = TempEnvVar {
+            key: "HOME",
+            previous: previous_home,
+            cleanup_dir: Some(home_dir.clone()),
+        };
+
+        let userprofile_guard = set_temp_env_var("USERPROFILE", &home_dir);
+
+        FakeGeminiHome {
+            _home: home_guard,
+            _userprofile: userprofile_guard,
+        }
+    }
+
+    fn write_fake_gemini_script(temp_dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let script_path = temp_dir.join("gemini.cmd");
+        #[cfg(not(windows))]
+        let script_path = temp_dir.join("gemini");
+
+        #[cfg(windows)]
+        let script = r#"@echo off
+if "%1"=="--version" (
+  echo gemini fake 1.0
+  exit /b 0
+)
+powershell -NoProfile -Command "Start-Sleep -Seconds 10; Write-Output 'fake gemini output'"
+exit /b 0
+"#;
+
+        #[cfg(not(windows))]
+        let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'gemini fake 1.0'
+  exit 0
+fi
+sleep 10
+printf '%s\n' 'fake gemini output'
+"#;
+
+        fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+        }
+        script_path
+    }
+
+    #[test]
+    fn rejects_unknown_auth_method() {
+        let err = GeminiCliDriver::validate_auth_method("wrong-method").unwrap_err();
+        let message = serde_json::to_value(&err)
+            .unwrap()
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(message.contains("unsupported auth method"));
+    }
+
+    #[test]
+    fn missing_gemini_binary_returns_helpful_error() {
+        let err = GeminiCliDriver::check_cli_available("/definitely/missing/gemini").unwrap_err();
+        let message = serde_json::to_value(&err)
+            .unwrap()
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(message.contains("Install it or set XSFIRE_GEMINI_BIN"));
+    }
+
+    #[test]
+    fn authenticate_request_uses_supported_method() {
+        let request = AuthenticateRequest::new("gemini-cli");
+        assert_eq!(
+            request.method_id.0.as_ref(),
+            GeminiCliDriver::AUTH_METHOD_ID
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_rejects_missing_auth_configuration() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(None, None, false);
+        let _auth_env = clear_gemini_auth_env();
+
+        let driver = GeminiCliDriver::new();
+        let error = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await
+            .unwrap_err();
+        let message = error_message(&error);
+        assert!(message.contains("no auth method is configured"));
+        assert!(message.contains("GEMINI_API_KEY"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_accepts_gemini_api_key_env() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(None, None, false);
+        let _auth_env = clear_gemini_auth_env();
+        let _api_key = set_temp_env_var("GEMINI_API_KEY", "test-key");
+
+        let driver = GeminiCliDriver::new();
+        let response = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_requires_oauth_credentials_file() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(Some("oauth-personal"), None, false);
+        let _auth_env = clear_gemini_auth_env();
+
+        let driver = GeminiCliDriver::new();
+        let error = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await
+            .unwrap_err();
+        let message = error_message(&error);
+        assert!(message.contains("oauth-personal"));
+        assert!(message.contains("oauth_creds.json"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_accepts_oauth_credentials_file() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(Some("oauth-personal"), None, true);
+        let _auth_env = clear_gemini_auth_env();
+
+        let driver = GeminiCliDriver::new();
+        let response = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_accepts_vertex_ai_env() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(Some("vertex-ai"), None, false);
+        let _auth_env = clear_gemini_auth_env();
+        let _google_api_key = set_temp_env_var("GOOGLE_API_KEY", "vertex-key");
+
+        let driver = GeminiCliDriver::new();
+        let response = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await;
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_rejects_enforced_auth_mismatch() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(None, Some("oauth-personal"), false);
+        let _auth_env = clear_gemini_auth_env();
+        let _vertex = set_temp_env_var("GOOGLE_GENAI_USE_VERTEXAI", "true");
+
+        let driver = GeminiCliDriver::new();
+        let error = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await
+            .unwrap_err();
+        let message = error_message(&error);
+        assert!(message.contains("enforces auth type `oauth-personal`"));
+        assert!(message.contains("resolved `vertex-ai`"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_prefers_selected_type_over_env() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+        let _home = install_fake_gemini_home(Some("oauth-personal"), Some("oauth-personal"), true);
+        let _auth_env = clear_gemini_auth_env();
+        let _vertex = set_temp_env_var("GOOGLE_GENAI_USE_VERTEXAI", "true");
+
+        let driver = GeminiCliDriver::new();
+        let response = driver
+            .authenticate(AuthenticateRequest::new("gemini-cli"))
+            .await;
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn auth_type_from_env_prefers_explicit_google_flags() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _auth_env = clear_gemini_auth_env();
+        let _api_key = set_temp_env_var("GEMINI_API_KEY", "test-key");
+        let _vertex = set_temp_env_var("GOOGLE_GENAI_USE_VERTEXAI", "true");
+
+        assert_eq!(
+            GeminiCliDriver::auth_type_from_env(),
+            Some(super::GeminiAuthType::VertexAi)
+        );
+    }
+
+    fn error_message(error: &Error) -> String {
+        serde_json::to_value(error)
+            .unwrap()
+            .get("data")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_stops_running_prompt() {
+        let _guard = crate::session_store::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _bin = install_fake_gemini_bin();
+
+        let driver = GeminiCliDriver::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session = driver
+            .new_session(NewSessionRequest::new(cwd))
+            .await
+            .unwrap();
+        let session_id = session.session_id.clone();
+
+        let prompt = driver.prompt(PromptRequest::new(session_id.clone(), vec!["hello".into()]));
+        let cancel = async {
+            for _ in 0..100 {
+                let active = {
+                    let sessions = driver.sessions.borrow();
+                    sessions
+                        .get(&session_id)
+                        .and_then(|session| session.active_prompt.as_ref())
+                        .is_some()
+                };
+                if active {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            driver
+                .cancel(CancelNotification::new(session_id.clone()))
+                .await
+                .unwrap();
+        };
+
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let (response, ()) = tokio::join!(prompt, cancel);
+            response
+        })
+        .await
+        .expect("prompt should stop after cancel")
+        .unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::Cancelled);
+
+        let sessions = driver.sessions.borrow();
+        let session = sessions.get(&session_id).unwrap();
+        assert!(session.history.is_empty());
+        assert!(session.active_prompt.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_session_model_updates_gemini_session() {
+        let driver = GeminiCliDriver::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session = driver
+            .new_session(NewSessionRequest::new(cwd))
+            .await
+            .unwrap();
+        let session_id = session.session_id.clone();
+
+        driver
+            .set_session_model(SetSessionModelRequest::new(
+                session_id.clone(),
+                "gemini-2.5-pro",
+            ))
+            .await
+            .unwrap();
+
+        let sessions = driver.sessions.borrow();
+        let session = sessions.get(&session_id).unwrap();
+        assert_eq!(session.model.as_deref(), Some("gemini-2.5-pro"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_session_config_option_updates_model_and_rejects_other_options() {
+        let driver = GeminiCliDriver::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session = driver
+            .new_session(NewSessionRequest::new(cwd))
+            .await
+            .unwrap();
+        let session_id = session.session_id.clone();
+
+        let response = driver
+            .set_session_config_option(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                "model",
+                "gemini-2.5-flash",
+            ))
+            .await
+            .unwrap();
+
+        let sessions = driver.sessions.borrow();
+        let session = sessions.get(&session_id).unwrap();
+        assert_eq!(session.model.as_deref(), Some("gemini-2.5-flash"));
+        let selected_model = response
+            .config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "model")
+            .map(|option| match &option.kind {
+                SessionConfigKind::Select(select) => select.current_value.0.to_string(),
+                _ => panic!("model config option should be a select"),
+            });
+        assert_eq!(selected_model.as_deref(), Some("gemini-2.5-flash"));
+        drop(sessions);
+
+        let error = driver
+            .set_session_config_option(SetSessionConfigOptionRequest::new(
+                session_id,
+                "temperature",
+                "0.2",
+            ))
+            .await
+            .unwrap_err();
+        let message = error_message(&error);
+        assert!(message.contains("unsupported config option for gemini backend"));
     }
 }

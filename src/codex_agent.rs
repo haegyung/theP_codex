@@ -1,13 +1,18 @@
 use agent_client_protocol::{
     AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, Error, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    ClientCapabilities, CreateTerminalRequest, Error, ForkSessionRequest, ForkSessionResponse,
+    KillTerminalCommandRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionInfo,
+    NewSessionResponse, PromptRequest, PromptResponse, ReleaseTerminalRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionInfo,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, TerminalOutputRequest,
+    WaitForTerminalExitRequest,
 };
 use codex_core::{
-    NewThread, ResponseItem, RolloutRecorder, ThreadManager, ThreadSortKey,
+    ExecCommandRequest, NewThread, ResponseItem, RolloutRecorder, ThreadManager, ThreadSortKey,
+    UnifiedExecContext, UnifiedExecDelegate, UnifiedExecDelegateFactory, UnifiedExecError,
+    UnifiedExecResponse, WriteStdinRequest,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
@@ -17,20 +22,28 @@ use codex_core::{
     protocol::{InitialHistory, SessionSource},
 };
 use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::{ThreadId, protocol::SessionMetaLine};
+use codex_protocol::{
+    ThreadId,
+    protocol::{RolloutItem, SessionMetaLine},
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    io::{self, Write},
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
+use uuid::Uuid;
 
 use crate::{
+    acp_create_terminal, acp_kill_terminal_command, acp_release_terminal, acp_terminal_output,
+    acp_wait_for_terminal_exit,
     backend::{BackendDriver, BackendKind},
     local_spawner::{AcpFs, LocalSpawner},
+    resolve_session_alias,
     session_store::{GlobalSessionIndex, SessionStore},
     thread::Thread,
 };
@@ -60,6 +73,226 @@ pub struct CodexDriver {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const XSFIRE_CODEX_OPEN_BROWSER_ENV_VAR: &str = "XSFIRE_CODEX_OPEN_BROWSER";
+const ACP_TERMINAL_OUTPUT_BYTE_LIMIT_DEFAULT: u64 = 32 * 1024;
+const ACP_TERMINAL_OUTPUT_BYTE_LIMIT_MIN: u64 = 4 * 1024;
+const ACP_TERMINAL_OUTPUT_BYTE_LIMIT_MAX: u64 = 512 * 1024;
+
+#[derive(Clone, Debug)]
+struct AcpTerminalHandle {
+    session_id: SessionId,
+    terminal_id: String,
+}
+
+struct AcpUnifiedExecDelegate {
+    session_id: SessionId,
+    client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    terminals: Arc<Mutex<HashMap<String, AcpTerminalHandle>>>,
+}
+
+impl AcpUnifiedExecDelegate {
+    fn new(session_id: SessionId, client_capabilities: Arc<Mutex<ClientCapabilities>>) -> Self {
+        Self {
+            session_id,
+            client_capabilities,
+            terminals: Arc::default(),
+        }
+    }
+
+    fn routed_session_id(&self) -> SessionId {
+        resolve_session_alias(&self.session_id)
+    }
+
+    fn supports_standard_terminal(&self) -> bool {
+        self.client_capabilities.lock().unwrap().terminal
+    }
+
+    fn output_byte_limit(max_output_tokens: Option<usize>) -> u64 {
+        max_output_tokens
+            .map(|tokens| tokens.saturating_mul(4) as u64)
+            .unwrap_or(ACP_TERMINAL_OUTPUT_BYTE_LIMIT_DEFAULT)
+            .clamp(
+                ACP_TERMINAL_OUTPUT_BYTE_LIMIT_MIN,
+                ACP_TERMINAL_OUTPUT_BYTE_LIMIT_MAX,
+            )
+    }
+
+    fn exit_code_from_terminal_status(
+        exit_status: &Option<agent_client_protocol::TerminalExitStatus>,
+    ) -> Option<i32> {
+        exit_status
+            .as_ref()
+            .and_then(|status| status.exit_code)
+            .and_then(|code| i32::try_from(code).ok())
+    }
+
+    fn unified_exec_response(
+        request_process_id: &str,
+        request_command: &[String],
+        request_workdir: &Option<PathBuf>,
+        context: &UnifiedExecContext,
+        terminal_id: &str,
+        output: String,
+        exit_status: &Option<agent_client_protocol::TerminalExitStatus>,
+        still_running: bool,
+    ) -> UnifiedExecResponse {
+        let raw_output = output.as_bytes().to_vec();
+        UnifiedExecResponse {
+            event_call_id: context.call_id().to_string(),
+            chunk_id: Uuid::new_v4().to_string(),
+            wall_time: std::time::Duration::from_millis(0),
+            output,
+            raw_output,
+            process_id: still_running.then(|| request_process_id.to_string()),
+            exit_code: Self::exit_code_from_terminal_status(exit_status),
+            original_token_count: None,
+            terminal_id: Some(terminal_id.to_string()),
+            session_command: Some(request_command.to_vec()),
+            session_cwd: request_workdir
+                .clone()
+                .or_else(|| Some(context.cwd().to_path_buf())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UnifiedExecDelegate for AcpUnifiedExecDelegate {
+    async fn exec_command(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+        if !self.supports_standard_terminal() {
+            return Err(UnifiedExecError::create_process(
+                "ACP client does not advertise terminal support".to_string(),
+            ));
+        }
+        let Some((command, args)) = request.command.split_first() else {
+            return Err(UnifiedExecError::MissingCommandLine);
+        };
+
+        let session_id = self.routed_session_id();
+        let create_request = CreateTerminalRequest::new(session_id.clone(), command.clone())
+            .args(args.to_vec())
+            .cwd(request.workdir.clone())
+            .output_byte_limit(Self::output_byte_limit(request.max_output_tokens));
+        let create_response = acp_create_terminal(create_request)
+            .await
+            .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        let terminal_id = create_response.terminal_id.0.as_ref().to_string();
+        let output_response = acp_terminal_output(TerminalOutputRequest::new(
+            session_id.clone(),
+            create_response.terminal_id.clone(),
+        ))
+        .await
+        .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+
+        let still_running = output_response.exit_status.is_none();
+        if still_running {
+            self.terminals.lock().unwrap().insert(
+                request.process_id.clone(),
+                AcpTerminalHandle {
+                    session_id,
+                    terminal_id: terminal_id.clone(),
+                },
+            );
+        } else {
+            acp_release_terminal(ReleaseTerminalRequest::new(
+                session_id,
+                create_response.terminal_id,
+            ))
+            .await
+            .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        }
+
+        Ok(Self::unified_exec_response(
+            &request.process_id,
+            &request.command,
+            &request.workdir,
+            context,
+            &terminal_id,
+            output_response.output,
+            &output_response.exit_status,
+            still_running,
+        ))
+    }
+
+    async fn write_stdin(
+        &self,
+        request: WriteStdinRequest,
+        context: &UnifiedExecContext,
+    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+        if !request.input.is_empty() {
+            return Err(UnifiedExecError::StdinClosed);
+        }
+        let handle = self
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&request.process_id)
+            .cloned()
+            .ok_or_else(|| UnifiedExecError::UnknownProcessId {
+                process_id: request.process_id.clone(),
+            })?;
+        let output_response = acp_terminal_output(TerminalOutputRequest::new(
+            handle.session_id.clone(),
+            agent_client_protocol::TerminalId::new(handle.terminal_id.clone()),
+        ))
+        .await
+        .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+
+        let still_running = output_response.exit_status.is_none();
+        if !still_running {
+            self.terminals.lock().unwrap().remove(&request.process_id);
+            acp_release_terminal(ReleaseTerminalRequest::new(
+                handle.session_id.clone(),
+                agent_client_protocol::TerminalId::new(handle.terminal_id.clone()),
+            ))
+            .await
+            .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        }
+
+        Ok(Self::unified_exec_response(
+            &request.process_id,
+            &[],
+            &None,
+            context,
+            &handle.terminal_id,
+            output_response.output,
+            &output_response.exit_status,
+            still_running,
+        ))
+    }
+
+    async fn terminate_all_processes(&self) -> Result<(), UnifiedExecError> {
+        let handles = {
+            let mut terminals = self.terminals.lock().unwrap();
+            terminals
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let terminal_id = agent_client_protocol::TerminalId::new(handle.terminal_id.clone());
+            acp_kill_terminal_command(KillTerminalCommandRequest::new(
+                handle.session_id.clone(),
+                terminal_id.clone(),
+            ))
+            .await
+            .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+            acp_wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                handle.session_id.clone(),
+                terminal_id.clone(),
+            ))
+            .await
+            .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+            acp_release_terminal(ReleaseTerminalRequest::new(handle.session_id, terminal_id))
+                .await
+                .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        }
+        Ok(())
+    }
+}
 
 impl CodexDriver {
     /// Create a new `CodexDriver` with the given configuration.
@@ -72,6 +305,7 @@ impl CodexDriver {
 
         let local_spawner = LocalSpawner::new();
         let capabilities_clone = client_capabilities.clone();
+        let unified_exec_client_capabilities = client_capabilities.clone();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
         let session_roots_clone = session_roots.clone();
         let thread_manager = ThreadManager::new_with_fs(
@@ -87,6 +321,12 @@ impl CodexDriver {
                     session_roots_clone.clone(),
                 ))
             }),
+            Some(Arc::new(move |thread_id| {
+                Arc::new(AcpUnifiedExecDelegate::new(
+                    Self::session_id_from_thread_id(thread_id),
+                    unified_exec_client_capabilities.clone(),
+                )) as Arc<dyn UnifiedExecDelegate>
+            }) as UnifiedExecDelegateFactory),
         );
 
         let global_session_index = GlobalSessionIndex::load().map(|idx| Arc::new(Mutex::new(idx)));
@@ -112,6 +352,12 @@ impl CodexDriver {
             .get(session_id)
             .ok_or_else(|| Error::resource_not_found(None))?
             .clone())
+    }
+
+    fn should_open_chatgpt_browser() -> bool {
+        std::env::var(XSFIRE_CODEX_OPEN_BROWSER_ENV_VAR)
+            .map(|value| is_truthy_env_value(&value))
+            .unwrap_or(false)
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
@@ -204,12 +450,85 @@ impl CodexDriver {
 
         Ok(config)
     }
+
+    async fn resolve_rollout_path(&self, session_id: &SessionId) -> Result<PathBuf, Error> {
+        find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+            .ok_or_else(|| Error::resource_not_found(None))
+    }
+
+    fn build_session_store(
+        &self,
+        session_id: &SessionId,
+        config: &Config,
+        thread_id: &ThreadId,
+    ) -> Option<SessionStore> {
+        let mut index = self.global_session_index.as_ref()?.lock().ok()?;
+        let global_id = index.get_or_create(&format!("codex:{}", session_id.0))?;
+        SessionStore::init(
+            global_id,
+            "codex",
+            session_id.0.as_ref().to_string(),
+            thread_id.to_string(),
+            Some(&config.cwd),
+        )
+    }
+
+    async fn register_thread(
+        &self,
+        session_id: SessionId,
+        config: Config,
+        new_thread: NewThread,
+        replay_history: Option<Vec<RolloutItem>>,
+    ) -> Result<LoadSessionResponse, Error> {
+        let NewThread {
+            thread_id,
+            thread,
+            session_configured: _,
+        } = new_thread;
+
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.cwd.clone());
+
+        let thread = Rc::new(Thread::new(
+            session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            self.thread_manager.get_models_manager(),
+            self.client_capabilities.clone(),
+            config.clone(),
+            self.build_session_store(&session_id, &config, &thread_id),
+        ));
+
+        if let Some(history) = replay_history.filter(|history| !history.is_empty()) {
+            thread.replay_history(history).await?;
+        }
+
+        let load = thread.load().await?;
+        self.sessions.borrow_mut().insert(session_id, thread);
+        Ok(load)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
 impl BackendDriver for CodexDriver {
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Codex
+    }
+
+    fn supports_load_session(&self) -> bool {
+        true
+    }
+
+    fn supports_fork_session(&self) -> bool {
+        true
+    }
+
+    fn supports_resume_session(&self) -> bool {
+        true
     }
 
     fn auth_methods(&self) -> Vec<AuthMethod> {
@@ -247,16 +566,19 @@ impl BackendDriver for CodexDriver {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
-                let opts = codex_login::ServerOptions::new(
+                // ACP runs inside IDE hosts where OS-level browser launches can fail noisily.
+                let mut opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
                     codex_core::auth::CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
                 );
+                let open_browser = Self::should_open_chatgpt_browser();
+                opts.open_browser = open_browser;
 
                 let server =
                     codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+                emit_chatgpt_login_instructions(server.actual_port, &server.auth_url, open_browser);
 
                 server
                     .block_until_done()
@@ -306,54 +628,21 @@ impl BackendDriver for CodexDriver {
         let config = self.build_session_config(&cwd, mcp_servers)?;
         let num_mcp_servers = config.mcp_servers.len();
 
-        let NewThread {
-            thread_id,
-            thread,
-            session_configured: _,
-        } = Box::pin(self.thread_manager.start_thread(config.clone()))
+        let new_thread = Box::pin(self.thread_manager.start_thread(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
-
-        let session_id = Self::session_id_from_thread_id(thread_id);
-        // Record the session root for filesystem sandboxing.
-        self.session_roots
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), config.cwd.clone());
-
-        let session_store = self.global_session_index.as_ref().and_then(|idx| {
-            let mut index = idx.lock().ok()?;
-            let global_id = index.get_or_create(&format!("codex:{}", session_id.0))?;
-            SessionStore::init(
-                global_id,
-                "codex",
-                session_id.0.as_ref().to_string(),
-                thread_id.to_string(),
-                Some(&config.cwd),
-            )
-        });
-
-        let thread = Rc::new(Thread::new(
-            session_id.clone(),
-            thread,
-            self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
-            self.client_capabilities.clone(),
-            config.clone(),
-            session_store,
-        ));
-        let load = thread.load().await?;
-
-        self.sessions
-            .borrow_mut()
-            .insert(session_id.clone(), thread);
+        let session_id = Self::session_id_from_thread_id(new_thread.thread_id);
+        let load = self
+            .register_thread(session_id.clone(), config, new_thread, None)
+            .await?;
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
             .models(load.models)
-            .config_options(load.config_options))
+            .config_options(load.config_options)
+            .meta(load.meta))
     }
 
     async fn load_session(
@@ -371,11 +660,7 @@ impl BackendDriver for CodexDriver {
             ..
         } = request;
 
-        let rollout_path =
-            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?
-                .ok_or_else(|| Error::resource_not_found(None))?;
+        let rollout_path = self.resolve_rollout_path(&session_id).await?;
 
         let history = RolloutRecorder::get_rollout_history(&rollout_path)
             .await
@@ -389,11 +674,7 @@ impl BackendDriver for CodexDriver {
 
         let config = self.build_session_config(&cwd, mcp_servers)?;
 
-        let NewThread {
-            thread_id,
-            thread,
-            session_configured: _,
-        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
+        let new_thread = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
             rollout_path,
             self.auth_manager.clone(),
@@ -401,42 +682,75 @@ impl BackendDriver for CodexDriver {
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        let session_store = self.global_session_index.as_ref().and_then(|idx| {
-            let mut index = idx.lock().ok()?;
-            let global_id = index.get_or_create(&format!("codex:{}", session_id.0))?;
-            SessionStore::init(
-                global_id,
-                "codex",
-                session_id.0.as_ref().to_string(),
-                thread_id.to_string(),
-                Some(&config.cwd),
-            )
-        });
+        self.register_thread(session_id, config, new_thread, Some(rollout_items))
+            .await
+    }
 
-        let thread = Rc::new(Thread::new(
-            session_id.clone(),
-            thread,
-            self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
-            self.client_capabilities.clone(),
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        self.check_auth().await?;
+
+        let ForkSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+        let rollout_path = self.resolve_rollout_path(&session_id).await?;
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let new_thread = Box::pin(self.thread_manager.fork_thread(
+            usize::MAX,
             config.clone(),
-            session_store,
-        ));
+            rollout_path,
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        thread.replay_history(rollout_items).await?;
+        let forked_session_id = Self::session_id_from_thread_id(new_thread.thread_id);
+        let load = self
+            .register_thread(forked_session_id.clone(), config, new_thread, None)
+            .await?;
 
-        let load = thread.load().await?;
-
-        self.session_roots
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), config.cwd);
-        self.sessions.borrow_mut().insert(session_id, thread);
-
-        Ok(LoadSessionResponse::new()
+        Ok(ForkSessionResponse::new(forked_session_id)
             .modes(load.modes)
             .models(load.models)
-            .config_options(load.config_options))
+            .config_options(load.config_options)
+            .meta(load.meta))
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        self.check_auth().await?;
+
+        let ResumeSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+        let rollout_path = self.resolve_rollout_path(&session_id).await?;
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let new_thread = Box::pin(self.thread_manager.resume_thread_from_rollout(
+            config.clone(),
+            rollout_path,
+            self.auth_manager.clone(),
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let load = self
+            .register_thread(session_id, config, new_thread, None)
+            .await?;
+
+        Ok(ResumeSessionResponse::new()
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options)
+            .meta(load.meta))
     }
 
     async fn list_sessions(
@@ -596,7 +910,7 @@ impl From<CodexAuthMethod> for AuthMethod {
     fn from(method: CodexAuthMethod) -> Self {
         match method {
             CodexAuthMethod::ChatGpt => Self::new(method, "ChatGPT (Browser login)").description(
-                "Opens a local login server and launches your browser.\nComplete login, then return to the IDE.\nTip: set NO_BROWSER=1 for headless/SSH workflows and use an API key method.",
+                "Starts a local login server and prints the auth URL to stderr.\nBrowser auto-open is disabled by default in ACP to avoid OS open failures; set XSFIRE_CODEX_OPEN_BROWSER=1 to re-enable it.\nTip: set NO_BROWSER=1 for headless/SSH workflows and use an API key method.",
             ),
             CodexAuthMethod::CodexApiKey => {
                 Self::new(method, format!("API key ({CODEX_API_KEY_ENV_VAR})")).description(
@@ -629,6 +943,33 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
     }
 }
 
+fn is_truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn emit_chatgpt_login_instructions(actual_port: u16, auth_url: &str, open_browser: bool) {
+    let browser_message = if open_browser {
+        format!("If your browser did not open, navigate to this URL to authenticate:\n\n{auth_url}")
+    } else {
+        format!(
+            "Browser auto-open is disabled in ACP to avoid OS open failures.\nOpen this URL to authenticate:\n\n{auth_url}\n\nSet {XSFIRE_CODEX_OPEN_BROWSER_ENV_VAR}=1 to re-enable browser auto-open."
+        )
+    };
+
+    let mut stderr = io::stderr().lock();
+    if writeln!(
+        stderr,
+        "Starting local login server on http://localhost:{actual_port}.\n{browser_message}"
+    )
+    .is_err()
+    {
+        // Stderr may be unavailable in some ACP hosts; login can still continue with the local server.
+    }
+}
+
 fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
     let mut graphemes = text.grapheme_indices(true);
 
@@ -657,5 +998,24 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_truthy_env_value;
+
+    #[test]
+    fn parses_truthy_env_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(is_truthy_env_value(value), "{value} should be truthy");
+        }
+    }
+
+    #[test]
+    fn rejects_non_truthy_env_values() {
+        for value in ["", "0", "false", "off", "no", "random"] {
+            assert!(!is_truthy_env_value(value), "{value} should be false");
+        }
     }
 }

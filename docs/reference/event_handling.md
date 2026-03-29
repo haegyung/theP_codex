@@ -6,8 +6,8 @@
 |---|---|---|
 | `PlanUpdate` | `SessionUpdate::Plan` | 계획 업데이트를 `Plan` notification으로 전달해, 클라이언트가 단계별 진행 상황을 실시간으로 볼 수 있게 합니다. |
 | `ExecApprovalRequest` | `RequestPermission` (비동기 approve/abort 옵션) | 명령 실행 전 승인이 필요할 때, `ToolCallUpdate`와 함께 옵션을 보여주고 결정 결과를 Codex에 전달합니다. |
-| `ExecCommandBegin` / `ExecCommandOutputDelta` / `ExecCommandEnd` | `ToolCall`, `ToolCallUpdate` | 명령 시작 시 ToolCall 생성, 출력/terminal stream, 종료(성공/실패) 상태를 잇따라 업데이트합니다. |
-| `TerminalInteraction` | `ToolCallUpdate` (meta terminal_output) | 터미널 stdin/출력을 메타로 내려보내 클라이언트 터미널 뷰를 활성화합니다. |
+| `ExecCommandBegin` / `ExecCommandOutputDelta` / `ExecCommandEnd` | `ToolCall`, `ToolCallUpdate` | 명령 시작 시 ToolCall 생성, 출력 업데이트, 종료(성공/실패) 상태를 잇따라 업데이트합니다. 표준 `terminal=true` 클라이언트에는 ACP `terminal/create`에서 받은 실제 `terminal_id`를 `ToolCallContent::Terminal`로 전달하고, legacy terminal extension이 있으면 embedded terminal stream도 함께 유지합니다. real `terminal_id`가 없을 때만 plain-text fallback을 보냅니다. |
+| `TerminalInteraction` | `ToolCallUpdate` (meta terminal_output) | `_meta.terminal_output=true`를 광고한 legacy 클라이언트에만 터미널 stdin/출력을 메타로 내려보내 embedded terminal 뷰를 유지합니다. 표준 terminal lifecycle은 ACP `terminal/*` RPC로 처리합니다. |
 | `McpToolCallBegin` / `McpToolCallEnd` | `ToolCall`, `ToolCallUpdate` | MCP 도구 호출의 시작/완료를 ToolCall 형태로 전달하고 상태/결과를 이어서 표시합니다. |
 | `ApplyPatchApprovalRequest`, `PatchApplyBegin`, `PatchApplyEnd` | `ToolCall`/`Plan` 흐름 | apply_patch 관련 승인/패치 상태도 ToolCall/Plan으로 표현합니다. |
 | `RequestUserInput`, `DynamicToolCallRequest` | `RequestPermission` | 추가 입력이나 dynamic tool 요청은 `RequestPermission`으로 옵션을 제공하고 선택을 Codex에 피드백합니다. |

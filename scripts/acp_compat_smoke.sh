@@ -109,8 +109,8 @@ run_rg_absent "MCP SSE is not advertised as enabled" \
 run_rg_present "session list capability is advertised" \
   "SessionCapabilities::new\\(\\)\\.list\\(SessionListCapabilities::new\\(\\)\\)" \
   "src/acp_agent.rs"
-run_rg_present "load_session is gated to codex backend" \
-  "backend_kind\\(\\) == BackendKind::Codex" \
+run_rg_present "load_session capability is delegated to backend driver" \
+  "let load_session = self\\.driver\\.supports_load_session\\(\\);" \
   "src/acp_agent.rs"
 
 # Event stream and progress/plan pathways.
@@ -131,21 +131,63 @@ run_rg_present "permission response is canonically logged" \
 run_rg_present "claude load_session unsupported contract" \
   "load_session is not supported for --backend=claude-code yet" \
   "src/claude_code_agent.rs"
-run_rg_present "claude set_session_model unsupported contract" \
-  "set_session_model is not supported for --backend=claude-code yet" \
-  "src/claude_code_agent.rs"
-run_rg_present "claude set_session_config_option unsupported contract" \
-  "set_session_config_option is not supported for --backend=claude-code yet" \
-  "src/claude_code_agent.rs"
 run_rg_present "gemini load_session unsupported contract" \
   "load_session is not supported for --backend=gemini yet" \
   "src/gemini_agent.rs"
-run_rg_present "gemini set_session_model unsupported contract" \
-  "set_session_model is not supported for --backend=gemini yet" \
-  "src/gemini_agent.rs"
-run_rg_present "gemini set_session_config_option unsupported contract" \
-  "set_session_config_option is not supported for --backend=gemini yet" \
-  "src/gemini_agent.rs"
+run_rg_present "multi backend wraps codex pagination cursors" \
+  "MULTI_CODEX_CURSOR_PREFIX" \
+  "src/multi_backend.rs"
+run_rg_present "multi backend exposes deferred routed cursor" \
+  "MULTI_ROUTED_CURSOR" \
+  "src/multi_backend.rs"
+run_rg_present "ACP server advertises session fork support when backend does" \
+  "if self.driver.supports_fork_session\\(\\)" \
+  "src/acp_agent.rs"
+run_rg_present "ACP server advertises session resume support when backend does" \
+  "if self.driver.supports_resume_session\\(\\)" \
+  "src/acp_agent.rs"
+run_rg_present "codex backend implements session fork" \
+  "async fn fork_session\\(" \
+  "src/codex_agent.rs"
+run_rg_present "codex backend implements session resume" \
+  "async fn resume_session\\(" \
+  "src/codex_agent.rs"
+run_rg_present "multi backend routes session fork through codex" \
+  "self\\.codex_backing_session_for\\(&request\\.session_id, \"fork\"\\)" \
+  "src/multi_backend.rs"
+run_rg_present "multi backend routes session resume through codex" \
+  "self\\.codex_backing_session_for\\(&request\\.session_id, \"resume\"\\)" \
+  "src/multi_backend.rs"
+run_rg_present "codex ACP exec creates terminals through client RPC" \
+  "let create_response = acp_create_terminal\\(create_request\\)" \
+  "src/codex_agent.rs"
+run_rg_present "codex ACP exec polls terminal output through client RPC" \
+  "let output_response = acp_terminal_output\\(TerminalOutputRequest::new\\(" \
+  "src/codex_agent.rs"
+run_rg_present "codex ACP exec releases terminals through client RPC" \
+  "acp_release_terminal\\(ReleaseTerminalRequest::new\\(" \
+  "src/codex_agent.rs"
+run_rg_present "codex ACP exec cancel path waits for terminal exit" \
+  "acp_wait_for_terminal_exit\\(WaitForTerminalExitRequest::new\\(" \
+  "src/codex_agent.rs"
+run_rg_present "standard terminal clients receive real terminal ids when available" \
+  "Standard terminal clients only get terminal content when the exec layer already" \
+  "src/thread.rs"
+run_rg_present "ACP reference documents real terminal lifecycle" \
+  "terminal/create -> terminal/output -> terminal/release" \
+  "docs/reference/acp_standard_spec.md"
+run_rg_present "ACP reference documents codex fork resume support" \
+  '`session/fork` \\(unstable\\) \\| 지원' \
+  "docs/reference/acp_standard_spec.md"
+run_rg_present "ACP reference documents multi codex-backed fork resume routing" \
+  'session/fork`: `codex` 세션 id 또는 `codex`-backed routed session만 지원' \
+  "docs/reference/acp_standard_spec.md"
+run_rg_absent "ACP reference no longer claims terminal rpc is unimplemented" \
+  '현재 구현은 ACP 표준 `terminal/\*` RPC 전체를 직접 구현하지 않고' \
+  "docs/reference/acp_standard_spec.md"
+run_rg_absent "ACP reference no longer claims fork resume are unsupported" \
+  'session/fork`, `session/resume`은 아직 미지원입니다' \
+  "docs/reference/acp_standard_spec.md"
 
 if [[ "$SKIP_TESTS" == "true" ]]; then
   TEST_LINES+=("- cargo tests: skipped (--skip-tests)")
@@ -171,6 +213,62 @@ else
       "cargo test -q session_store::tests::writes_canonical_log_and_redacts_secrets" \
       "cargo test -q session_store::tests::writes_canonical_log_and_redacts_secrets" \
       "$LOG_DIR/acp_smoke_session_store_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q multi_backend::tests::list_sessions_defers_routed_sessions_until_codex_pages_finish" \
+      "cargo test -q multi_backend::tests::list_sessions_defers_routed_sessions_until_codex_pages_finish" \
+      "$LOG_DIR/acp_smoke_multi_session_list_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q multi_backend::tests::fork_session_wraps_codex_child_in_synthetic_multi_session" \
+      "cargo test -q multi_backend::tests::fork_session_wraps_codex_child_in_synthetic_multi_session" \
+      "$LOG_DIR/acp_smoke_multi_fork_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q multi_backend::tests::resume_session_registers_requested_session_id_as_codex_route" \
+      "cargo test -q multi_backend::tests::resume_session_registers_requested_session_id_as_codex_route" \
+      "$LOG_DIR/acp_smoke_multi_resume_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q claude_code_agent::tests::authenticate_checks_claude_status" \
+      "cargo test -q claude_code_agent::tests::authenticate_checks_claude_status" \
+      "$LOG_DIR/acp_smoke_claude_auth_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q claude_code_agent::tests::cancel_stops_running_prompt" \
+      "cargo test -q claude_code_agent::tests::cancel_stops_running_prompt" \
+      "$LOG_DIR/acp_smoke_claude_cancel_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q claude_code_agent::tests::set_session_model_updates_claude_session" \
+      "cargo test -q claude_code_agent::tests::set_session_model_updates_claude_session" \
+      "$LOG_DIR/acp_smoke_claude_model_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q claude_code_agent::tests::set_session_config_option_updates_model_and_rejects_other_options" \
+      "cargo test -q claude_code_agent::tests::set_session_config_option_updates_model_and_rejects_other_options" \
+      "$LOG_DIR/acp_smoke_claude_config_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q gemini_agent::tests::authenticate_accepts_gemini_api_key_env" \
+      "cargo test -q gemini_agent::tests::authenticate_accepts_gemini_api_key_env" \
+      "$LOG_DIR/acp_smoke_gemini_auth_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q gemini_agent::tests::cancel_stops_running_prompt" \
+      "cargo test -q gemini_agent::tests::cancel_stops_running_prompt" \
+      "$LOG_DIR/acp_smoke_gemini_cancel_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q gemini_agent::tests::set_session_model_updates_gemini_session" \
+      "cargo test -q gemini_agent::tests::set_session_model_updates_gemini_session" \
+      "$LOG_DIR/acp_smoke_gemini_model_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q gemini_agent::tests::set_session_config_option_updates_model_and_rejects_other_options" \
+      "cargo test -q gemini_agent::tests::set_session_config_option_updates_model_and_rejects_other_options" \
+      "$LOG_DIR/acp_smoke_gemini_config_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q thread::tests::test_exec_command_uses_legacy_terminal_extension_when_opted_in" \
+      "cargo test -q thread::tests::test_exec_command_uses_legacy_terminal_extension_when_opted_in" \
+      "$LOG_DIR/acp_smoke_terminal_legacy_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q thread::tests::test_exec_command_standard_terminal_clients_use_real_terminal_id_when_available" \
+      "cargo test -q thread::tests::test_exec_command_standard_terminal_clients_use_real_terminal_id_when_available" \
+      "$LOG_DIR/acp_smoke_terminal_standard_${TIMESTAMP}.log"
+    run_test_command \
+      "cargo test -q thread::tests::test_exec_command_standard_terminal_clients_fall_back_to_text_updates_without_terminal_id" \
+      "cargo test -q thread::tests::test_exec_command_standard_terminal_clients_fall_back_to_text_updates_without_terminal_id" \
+      "$LOG_DIR/acp_smoke_terminal_fallback_${TIMESTAMP}.log"
   else
     run_test_command \
       "cargo test -q thread::tests::" \

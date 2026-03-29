@@ -4,3 +4,4 @@ npm-packages
 .DS_Store
 logs
 .serena/
+.codex_tmp/

@@ -1,7 +1,8 @@
 use agent_client_protocol::{AuthMethod, SessionId};
 use agent_client_protocol::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ListSessionsRequest,
-    ListSessionsResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ForkSessionRequest,
+    ForkSessionResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
@@ -43,6 +44,14 @@ pub trait BackendDriver {
         self.backend_kind() == BackendKind::Codex
     }
 
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    fn supports_resume_session(&self) -> bool {
+        false
+    }
+
     fn auth_methods(&self) -> Vec<AuthMethod>;
 
     async fn authenticate(
@@ -56,6 +65,28 @@ pub trait BackendDriver {
         &self,
         request: agent_client_protocol::LoadSessionRequest,
     ) -> Result<agent_client_protocol::LoadSessionResponse, Error>;
+
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        drop(request);
+        Err(Error::invalid_params().data(format!(
+            "backend does not support session/fork: {}",
+            self.backend_kind().as_str()
+        )))
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        drop(request);
+        Err(Error::invalid_params().data(format!(
+            "backend does not support session/resume: {}",
+            self.backend_kind().as_str()
+        )))
+    }
 
     async fn list_sessions(
         &self,
@@ -136,6 +167,20 @@ impl BackendDriver for UnsupportedBackendDriver {
         &self,
         _request: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, Error> {
+        Err(self.err())
+    }
+
+    async fn fork_session(
+        &self,
+        _request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        Err(self.err())
+    }
+
+    async fn resume_session(
+        &self,
+        _request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
         Err(self.err())
     }
 

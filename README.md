@@ -59,6 +59,7 @@ Notes:
 - `claude-code` and `gemini` backends require their CLIs to be installed and authenticated.
 - In `multi` mode, switch backend in-thread: `/backend codex|claude-code|gemini`.
 - Backend-specific overrides:
+  - `XSFIRE_CODEX_OPEN_BROWSER=1` to let ACP-triggered ChatGPT login try opening your browser automatically
   - `XSFIRE_CLAUDE_BIN`, `XSFIRE_CLAUDE_ARGS`
   - `XSFIRE_GEMINI_BIN`, `XSFIRE_GEMINI_ARGS`, `XSFIRE_GEMINI_APPROVAL_MODE`
 
@@ -195,6 +196,9 @@ install -m 0755 target/release/xsfire-camp /usr/local/bin/xsfire-camp
 
 1. Auth error on startup
 - Check `OPENAI_API_KEY` or `CODEX_API_KEY` is set for Codex backend.
+- If you already ran `codex login`, point both CLI and ACP to the same `CODEX_HOME`; `xsfire-camp` will reuse the saved credentials.
+- ChatGPT login from ACP prints a localhost auth URL to stderr. Browser auto-open is disabled by default to avoid macOS app-open failures; set `XSFIRE_CODEX_OPEN_BROWSER=1` only if you want ACP to try launching the browser itself.
+- For headless or SSH workflows, set `NO_BROWSER=1` and use an API key auth method instead.
 
 2. Sessions not shared between CLI and ACP client
 - Ensure both run with the same `CODEX_HOME`.
@@ -227,6 +231,7 @@ install -m 0755 target/release/xsfire-camp /usr/local/bin/xsfire-camp
 - `docs/quality/verification_guidance.md`
 - `docs/quality/qa_checklist.md`
 - `docs/guides/github_registry_release_runbook.md`
+- `docs/releases/release_notes_v0.9.24.md`
 - `docs/releases/release_notes_v0.9.23.md`
 - `docs/releases/release_notes_v0.9.22.md`
 - `docs/releases/release_notes_v0.9.21.md`

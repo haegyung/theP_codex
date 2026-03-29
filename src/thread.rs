@@ -1697,6 +1697,7 @@ impl OneShotCommandState {
 struct ActiveCommand {
     call_id: String,
     tool_call_id: ToolCallId,
+    terminal_id: Option<String>,
     terminal_output: bool,
     output: String,
     visible_output_bytes: usize,
@@ -1705,6 +1706,12 @@ struct ActiveCommand {
     truncation_notice_sent: bool,
     pending_utf8_bytes: Vec<u8>,
     file_extension: Option<String>,
+}
+
+impl ActiveCommand {
+    fn display_terminal_id(&self) -> &str {
+        self.terminal_id.as_deref().unwrap_or(&self.call_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2093,14 +2100,14 @@ impl PromptState {
     async fn emit_exec_output_update(
         client: &SessionClient,
         active_command: &mut ActiveCommand,
-        call_id: &str,
+        _call_id: &str,
         data: String,
     ) {
         let Some(data) = Self::clamp_exec_output_for_ui(active_command, data) else {
             return;
         };
 
-        let update = if client.supports_terminal_output(active_command) {
+        let update = if client.supports_embedded_terminal_output(active_command) {
             ToolCallUpdate::new(
                 active_command.tool_call_id.clone(),
                 ToolCallUpdateFields::new(),
@@ -2108,10 +2115,12 @@ impl PromptState {
             .meta(Meta::from_iter([(
                 "terminal_output".to_owned(),
                 serde_json::json!({
-                    "terminal_id": call_id,
+                    "terminal_id": active_command.display_terminal_id(),
                     "data": data
                 }),
             )]))
+        } else if client.supports_standard_terminal() && active_command.terminal_id.is_some() {
+            return;
         } else {
             active_command.output.push_str(&data);
             let content = match active_command.file_extension.as_deref() {
@@ -2842,6 +2851,7 @@ impl PromptState {
             cwd,
             parsed_cmd,
             process_id: _,
+            terminal_id,
         } = event;
         if let Some(previous_call_id) = self
             .active_command
@@ -2869,6 +2879,7 @@ impl PromptState {
         let active_command = ActiveCommand {
             call_id: call_id.clone(),
             tool_call_id: tool_call_id.clone(),
+            terminal_id,
             output: String::new(),
             visible_output_bytes: 0,
             output_limit_bytes: Self::exec_output_limit_bytes_from_env(),
@@ -2878,16 +2889,29 @@ impl PromptState {
             file_extension,
             terminal_output,
         };
-        let (content, meta) = if client.supports_terminal_output(&active_command) {
-            let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
+        let (content, meta) = if client.supports_embedded_terminal_output(&active_command) {
+            let content = vec![ToolCallContent::Terminal(Terminal::new(
+                active_command.display_terminal_id().to_string(),
+            ))];
             let meta = Some(Meta::from_iter([(
                 "terminal_info".to_owned(),
                 serde_json::json!({
-                    "terminal_id": call_id.clone(),
+                    "terminal_id": active_command.display_terminal_id(),
                     "cwd": cwd
                 }),
             )]));
             (content, meta)
+        } else if client.supports_standard_terminal() {
+            // Standard terminal clients only get terminal content when the exec layer already
+            // delegated to ACP terminal/* and returned a real terminal id for this command.
+            let content = active_command
+                .terminal_id
+                .clone()
+                .map(Terminal::new)
+                .map(ToolCallContent::Terminal)
+                .into_iter()
+                .collect();
+            (content, None)
         } else {
             (vec![], None)
         };
@@ -2945,6 +2969,7 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
+            terminal_id,
         } = event;
         let status = if exit_code == 0 {
             ToolCallStatus::Completed
@@ -2975,16 +3000,21 @@ impl PromptState {
                                 .raw_output(raw_output),
                         )
                         .meta(
-                            client.supports_terminal_output(&active_command).then(|| {
-                                Meta::from_iter([(
-                                    "terminal_exit".into(),
-                                    serde_json::json!({
-                                        "terminal_id": call_id,
-                                        "exit_code": exit_code,
-                                        "signal": null
-                                    }),
-                                )])
-                            }),
+                            client
+                                .supports_embedded_terminal_output(&active_command)
+                                .then(|| {
+                                    Meta::from_iter([(
+                                        "terminal_exit".into(),
+                                        serde_json::json!({
+                                            "terminal_id": terminal_id
+                                                .as_deref()
+                                                .or(active_command.terminal_id.as_deref())
+                                                .unwrap_or(&call_id),
+                                            "exit_code": exit_code,
+                                            "signal": null
+                                        }),
+                                    )])
+                                }),
                         ),
                     )
                     .await;
@@ -3433,18 +3463,24 @@ impl SessionClient {
         }
     }
 
-    fn supports_terminal_output(&self, active_command: &ActiveCommand) -> bool {
-        active_command.terminal_output
-            && self
-                .client_capabilities
-                .lock()
-                .unwrap()
-                .meta
-                .as_ref()
-                .is_some_and(|v| {
-                    v.get("terminal_output")
-                        .is_some_and(|v| v.as_bool().unwrap_or_default())
-                })
+    fn supports_standard_terminal(&self) -> bool {
+        self.client_capabilities.lock().unwrap().terminal
+    }
+
+    fn supports_legacy_terminal_output_extension(&self) -> bool {
+        self.client_capabilities
+            .lock()
+            .unwrap()
+            .meta
+            .as_ref()
+            .is_some_and(|v| {
+                v.get("terminal_output")
+                    .is_some_and(|v| v.as_bool().unwrap_or_default())
+            })
+    }
+
+    fn supports_embedded_terminal_output(&self, active_command: &ActiveCommand) -> bool {
+        active_command.terminal_output && self.supports_legacy_terminal_output_extension()
     }
 
     async fn send_notification(&self, update: SessionUpdate) {
@@ -9708,9 +9744,17 @@ mod tests {
     }
 
     fn test_exec_begin_event(call_id: &str) -> ExecCommandBeginEvent {
+        test_exec_begin_event_with_terminal(call_id, None)
+    }
+
+    fn test_exec_begin_event_with_terminal(
+        call_id: &str,
+        terminal_id: Option<&str>,
+    ) -> ExecCommandBeginEvent {
         ExecCommandBeginEvent {
             call_id: call_id.to_string(),
             process_id: None,
+            terminal_id: terminal_id.map(str::to_string),
             turn_id: "turn-1".to_string(),
             command: vec!["sleep".to_string(), "300".to_string()],
             cwd: PathBuf::from("/tmp/repo"),
@@ -9723,9 +9767,18 @@ mod tests {
     }
 
     fn test_exec_end_event(call_id: &str, exit_code: i32) -> ExecCommandEndEvent {
+        test_exec_end_event_with_terminal(call_id, None, exit_code)
+    }
+
+    fn test_exec_end_event_with_terminal(
+        call_id: &str,
+        terminal_id: Option<&str>,
+        exit_code: i32,
+    ) -> ExecCommandEndEvent {
         ExecCommandEndEvent {
             call_id: call_id.to_string(),
             process_id: None,
+            terminal_id: terminal_id.map(str::to_string),
             turn_id: "turn-1".to_string(),
             command: vec!["sleep".to_string(), "300".to_string()],
             cwd: PathBuf::from("/tmp/repo"),
@@ -9740,6 +9793,14 @@ mod tests {
             exit_code,
             duration: std::time::Duration::from_millis(1),
             formatted_output: "ok".to_string(),
+        }
+    }
+
+    fn test_exec_output_delta_event(call_id: &str, data: &str) -> ExecCommandOutputDeltaEvent {
+        ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(),
+            stream: codex_core::protocol::ExecOutputStream::Stdout,
+            chunk: data.as_bytes().to_vec(),
         }
     }
 
@@ -10068,6 +10129,342 @@ mod tests {
         assert!(
             state.open_tool_calls.is_empty(),
             "expected watchdog to clear open tool calls"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_uses_legacy_terminal_extension_when_opted_in() -> anyhow::Result<()>
+    {
+        let session_id = SessionId::new("legacy-terminal-extension-test");
+        let client = Arc::new(StubClient::new());
+        let capabilities = Arc::new(std::sync::Mutex::new(ClientCapabilities::new().meta(
+            Meta::from_iter([("terminal_output".to_string(), json!(true))]),
+        )));
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), capabilities, None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-terminal-legacy".into());
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event_with_terminal(
+                    "exec-terminal-legacy",
+                    Some("terminal-legacy-123"),
+                )),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandOutputDelta(test_exec_output_delta_event(
+                    "exec-terminal-legacy",
+                    "hello from terminal\n",
+                )),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandEnd(test_exec_end_event_with_terminal(
+                    "exec-terminal-legacy",
+                    Some("terminal-legacy-123"),
+                    0,
+                )),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let Some(SessionNotification {
+            update: SessionUpdate::ToolCall(tool_call),
+            ..
+        }) = notifications.iter().find(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "exec-terminal-legacy"
+            )
+        })
+        else {
+            panic!("expected tool call notification. notifications={notifications:?}");
+        };
+        assert!(
+            matches!(
+                tool_call.content.as_slice(),
+                [ToolCallContent::Terminal(terminal)] if terminal.terminal_id.0.as_ref() == "terminal-legacy-123"
+            ),
+            "expected terminal content for legacy terminal extension. tool_call={tool_call:?}"
+        );
+        let terminal_info = tool_call
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("terminal_info"))
+            .and_then(serde_json::Value::as_object)
+            .expect("expected terminal_info meta");
+        assert_eq!(
+            terminal_info
+                .get("terminal_id")
+                .and_then(serde_json::Value::as_str),
+            Some("terminal-legacy-123")
+        );
+
+        let terminal_output =
+            notifications
+                .iter()
+                .find_map(|notification| match &notification.update {
+                    SessionUpdate::ToolCallUpdate(update)
+                        if update.tool_call_id.0.as_ref() == "exec-terminal-legacy" =>
+                    {
+                        update
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("terminal_output"))
+                    }
+                    _ => None,
+                });
+        let terminal_output = terminal_output.expect("expected terminal_output meta");
+        assert_eq!(
+            terminal_output
+                .get("terminal_id")
+                .and_then(serde_json::Value::as_str),
+            Some("terminal-legacy-123")
+        );
+        assert_eq!(
+            terminal_output
+                .get("data")
+                .and_then(serde_json::Value::as_str),
+            Some("hello from terminal\n")
+        );
+
+        let terminal_exit =
+            notifications
+                .iter()
+                .find_map(|notification| match &notification.update {
+                    SessionUpdate::ToolCallUpdate(update)
+                        if update.tool_call_id.0.as_ref() == "exec-terminal-legacy" =>
+                    {
+                        update
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("terminal_exit"))
+                    }
+                    _ => None,
+                });
+        let terminal_exit = terminal_exit.expect("expected terminal_exit meta");
+        assert_eq!(
+            terminal_exit
+                .get("terminal_id")
+                .and_then(serde_json::Value::as_str),
+            Some("terminal-legacy-123")
+        );
+        assert_eq!(
+            terminal_exit
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_standard_terminal_clients_use_real_terminal_id_when_available()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("standard-terminal-real-id-test");
+        let client = Arc::new(StubClient::new());
+        let capabilities = Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().terminal(true),
+        ));
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), capabilities, None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-terminal-standard".into());
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event_with_terminal(
+                    "exec-terminal-standard",
+                    Some("terminal-standard-123"),
+                )),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandOutputDelta(test_exec_output_delta_event(
+                    "exec-terminal-standard",
+                    "hello from real terminal\n",
+                )),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandEnd(test_exec_end_event_with_terminal(
+                    "exec-terminal-standard",
+                    Some("terminal-standard-123"),
+                    0,
+                )),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let Some(SessionNotification {
+            update: SessionUpdate::ToolCall(tool_call),
+            ..
+        }) = notifications.iter().find(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "exec-terminal-standard"
+            )
+        })
+        else {
+            panic!("expected tool call notification. notifications={notifications:?}");
+        };
+        assert!(
+            matches!(
+                tool_call.content.as_slice(),
+                [ToolCallContent::Terminal(terminal)] if terminal.terminal_id.0.as_ref() == "terminal-standard-123"
+            ),
+            "expected real terminal content for standard terminal client. tool_call={tool_call:?}"
+        );
+        assert!(
+            tool_call.meta.is_none(),
+            "standard terminal content should not carry legacy terminal meta. tool_call={tool_call:?}"
+        );
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::ToolCallUpdate(update)
+                        if update.tool_call_id.0.as_ref() == "exec-terminal-standard" =>
+                    {
+                        update.fields.content.is_none()
+                            && update.meta.as_ref().is_none_or(|meta| {
+                                !meta.contains_key("terminal_output")
+                                    && !meta.contains_key("terminal_exit")
+                            })
+                    }
+                    _ => true,
+                }),
+            "standard terminal clients with real terminal ids should not receive legacy or text fallback terminal updates. notifications={notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_standard_terminal_clients_fall_back_to_text_updates_without_terminal_id()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("standard-terminal-fallback-test");
+        let client = Arc::new(StubClient::new());
+        let capabilities = Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().terminal(true),
+        ));
+        let session_client =
+            SessionClient::with_client(session_id, client.clone(), capabilities, None);
+        let thread = Arc::new(StubCodexThread::new());
+        let mut state = PromptState::new_background(thread, "submission-terminal-standard".into());
+
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandBegin(test_exec_begin_event("exec-terminal-standard")),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandOutputDelta(test_exec_output_delta_event(
+                    "exec-terminal-standard",
+                    "hello from fallback\n",
+                )),
+            )
+            .await;
+        state
+            .handle_event(
+                &session_client,
+                EventMsg::ExecCommandEnd(test_exec_end_event("exec-terminal-standard", 0)),
+            )
+            .await;
+
+        let notifications = client.notifications.lock().unwrap();
+        let Some(SessionNotification {
+            update: SessionUpdate::ToolCall(tool_call),
+            ..
+        }) = notifications.iter().find(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCall(tool_call)
+                    if tool_call.tool_call_id.0.as_ref() == "exec-terminal-standard"
+            )
+        })
+        else {
+            panic!("expected tool call notification. notifications={notifications:?}");
+        };
+        assert!(
+            tool_call.content.is_empty(),
+            "standard terminal support without legacy extension must not emit synthetic terminal content. tool_call={tool_call:?}"
+        );
+        assert!(
+            tool_call.meta.is_none(),
+            "standard terminal fallback should not attach legacy terminal meta. tool_call={tool_call:?}"
+        );
+
+        let Some(SessionNotification {
+            update: SessionUpdate::ToolCallUpdate(update),
+            ..
+        }) = notifications.iter().find(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::ToolCallUpdate(update)
+                    if update.tool_call_id.0.as_ref() == "exec-terminal-standard"
+                        && update.fields.content.is_some()
+            )
+        })
+        else {
+            panic!("expected textual tool-call update. notifications={notifications:?}");
+        };
+        let content = update
+            .fields
+            .content
+            .as_ref()
+            .expect("expected content in text fallback update");
+        assert!(
+            matches!(
+                content.as_slice(),
+                [ToolCallContent::Content(block)]
+                    if matches!(
+                        &block.content,
+                        ContentBlock::Text(TextContent { text, .. })
+                            if text == "```sh\nhello from fallback\n```\n"
+                    )
+            ),
+            "expected plain text fallback output for standard terminal clients. update={update:?}"
+        );
+        assert!(
+            update.meta.is_none(),
+            "text fallback should not include legacy terminal_output meta. update={update:?}"
+        );
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| match &notification.update {
+                    SessionUpdate::ToolCallUpdate(update)
+                        if update.tool_call_id.0.as_ref() == "exec-terminal-standard" =>
+                    {
+                        update
+                            .meta
+                            .as_ref()
+                            .is_none_or(|meta| !meta.contains_key("terminal_exit"))
+                    }
+                    _ => true,
+                }),
+            "standard terminal fallback should not emit terminal_exit meta. notifications={notifications:?}"
         );
 
         Ok(())
@@ -10427,6 +10824,7 @@ mod tests {
                             msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: pending.call_id.clone(),
                                 process_id: None,
+                                terminal_id: None,
                                 turn_id: exec_id.clone(),
                                 command: pending.command.clone(),
                                 cwd: pending.cwd.clone(),
@@ -10452,6 +10850,7 @@ mod tests {
                             msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: pending.call_id,
                                 process_id: None,
+                                terminal_id: None,
                                 turn_id: exec_id.clone(),
                                 command: pending.command,
                                 cwd: pending.cwd,

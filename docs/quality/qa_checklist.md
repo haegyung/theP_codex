@@ -38,13 +38,13 @@ Use this checklist before tagging/publishing the extension release.
    - [ ] If strict mode fails, attach the corresponding failure log from `logs/smoke/logs/*.log` to the release issue/PR.
    - [ ] `initialize` returns `protocolVersion=v1` and advertises capability contract (`embeddedContext=true`, `image=true`, `audio=false`, `mcp.http=true`, `mcp.sse=false`, `session.list=true`).
    - [ ] `codex` backend passes core ACP flow: `authenticate` -> `session/new|load` -> repeated `session/prompt` -> `session/cancel` and returns valid JSON-RPC 2.0 envelopes.
-   - [ ] `claude-code`/`gemini` backends keep declared behavior: `session/load` and `session/set_model` are supported; `session/set_mode` returns `invalid_params`; `session/set_config_option` supports model changes and rejects unsupported options; `session/cancel` remains documented no-op.
+   - [ ] `claude-code`/`gemini` backends keep declared behavior: `authenticate` validates declared CLI readiness (`claude auth status` / Gemini auth configuration); `session/load` returns `invalid_params`; `session/set_model` is supported; `session/set_mode` returns `invalid_params`; `session/set_config_option` supports model changes and rejects unsupported options; `session/cancel` stops an active CLI prompt and yields `cancelled`.
    - [ ] `session/update` stream includes expected update types (`AgentMessageChunk`, `AgentThoughtChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `AvailableCommandsUpdate`, `CurrentModeUpdate`) without schema violations.
    - [ ] `ToolCall`/`Plan` status transitions stay in allowed enums (`pending`, `in_progress`, `completed`, `failed`) and do not regress state order during one turn.
    - [ ] `session/request_permission` round-trip is recorded with request/response pair in canonical logs when `ACP_HOME` logging is enabled.
    - [ ] `fs/*` capability path enforces session-root boundary checks and falls back to local FS access only when ACP FS capability is not advertised.
-   - [ ] `terminal/*` integration works only when client capability is present, and tool execution progress is surfaced via ACP updates.
-   - [ ] `session/list`, `session/set_model`, `session/set_config_option` (unstable) are smoke-tested against current schema versions and tracked as release risk if behavior changes.
+   - [ ] Terminal integration behavior is documented and smoke-tested: `codex` exec uses ACP `terminal/create -> terminal/output -> terminal/release` with `terminal/kill -> terminal/wait_for_exit` on cancellation, clients opting into legacy `_meta.terminal_output` receive embedded terminal updates, and plain-text fallback is used only when no real `terminal_id` is available.
+   - [ ] `session/list`, `session/set_model`, `session/set_config_option`, `session/fork`, `session/resume` (unstable) are smoke-tested against current schema versions and tracked as release risk if behavior changes. `codex` should support `session/fork` and `session/resume`; `multi` should verify wrapped codex cursors (`multi:codex:*`), deferred routed cursor (`multi:routed`), and that `session/fork|resume` only work for codex-backed sessions.
 
 Mark each step when complete and keep the checklist with the release notes for traceability.
 

@@ -1,11 +1,13 @@
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, Error, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionCapabilities, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    ClientCapabilities, Error, ForkSessionRequest, ForkSessionResponse, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionForkCapabilities,
+    SessionListCapabilities, SessionResumeCapabilities, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -51,8 +53,15 @@ impl Agent for AcpAgent {
             .mcp_capabilities(McpCapabilities::new().http(true))
             .load_session(load_session);
 
-        agent_capabilities.session_capabilities =
+        let mut session_capabilities =
             SessionCapabilities::new().list(SessionListCapabilities::new());
+        if self.driver.supports_fork_session() {
+            session_capabilities = session_capabilities.fork(SessionForkCapabilities::new());
+        }
+        if self.driver.supports_resume_session() {
+            session_capabilities = session_capabilities.resume(SessionResumeCapabilities::new());
+        }
+        agent_capabilities.session_capabilities = session_capabilities;
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -78,6 +87,20 @@ impl Agent for AcpAgent {
         request: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, Error> {
         self.driver.load_session(request).await
+    }
+
+    async fn fork_session(
+        &self,
+        request: ForkSessionRequest,
+    ) -> Result<ForkSessionResponse, Error> {
+        self.driver.fork_session(request).await
+    }
+
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        self.driver.resume_session(request).await
     }
 
     async fn list_sessions(
